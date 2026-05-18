@@ -53,6 +53,29 @@ python run_editor.py --project examples\age_of_discovery_demo.json
 
 If the basemap file in the project does not exist yet, open a basemap manually from the UI or build it first.
 
+## Render A Video From The Terminal
+
+Headless export without opening the editor:
+
+```powershell
+python render_project.py --project examples\age_of_discovery_demo.json
+```
+
+This writes an MP4 to `exports\age_of_discovery_demo.mp4` by default.
+
+Quick test render with smaller output and shorter duration:
+
+```powershell
+python render_project.py --project examples\age_of_discovery_demo.json --output exports\age_of_discovery_test.mp4 --width 960 --height 540 --fps 24 --duration 6
+```
+
+Useful overrides:
+
+- `--width` / `--height` -> render size override
+- `--fps` -> frame rate override
+- `--duration` -> temporary duration override for short test renders
+- `--output` -> custom MP4 output path
+
 ## Notes
 
 - This MVP uses a clean headless renderer plus a thin PyQt6 editor.

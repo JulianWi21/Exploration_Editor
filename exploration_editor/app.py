@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import time
 
+from PIL import Image
 from PyQt6.QtCore import QPointF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPolygonF
 from PyQt6.QtWidgets import (
@@ -70,6 +72,7 @@ class MapCanvas(QWidget):
         self.project_path: str | None = None
         self.font_path = str(font_path) if font_path else None
         self.basemap_image = load_basemap_image(None)
+        self._preview_basemap_levels = [self.basemap_image]
         self.frame_index = 0
         self.draw_kind: str | None = None
         self.target_layer_id: str | None = None
@@ -80,6 +83,10 @@ class MapCanvas(QWidget):
         self._last_layout: dict[str, float] | None = None
         self._cached_qimage: QImage | None = None
         self._cached_key: tuple[object, ...] | None = None
+        self._last_render_time = 0.0
+        self._interactive_render_timer = QTimer(self)
+        self._interactive_render_timer.setSingleShot(True)
+        self._interactive_render_timer.timeout.connect(self._render_now)
 
     def sizeHint(self):
         return self.minimumSize()
@@ -89,22 +96,50 @@ class MapCanvas(QWidget):
         self.project_path = project_path
         self.frame_index = min(self.frame_index, project.frame_count - 1)
         self.load_basemap(project.basemap_path)
-        self.invalidate_cache()
-        self.update()
 
     def load_basemap(self, basemap_path: str | None) -> None:
         self.basemap_image = load_basemap_image(basemap_path)
-        self.invalidate_cache()
-        self.update()
+        self._preview_basemap_levels = self._build_preview_basemap_levels(self.basemap_image)
+        self._render_now()
 
     def set_frame_index(self, frame_index: int) -> None:
         self.frame_index = max(0, min(project_frame_max(self.project), int(frame_index)))
+        self._render_now()
+
+    def invalidate_cache(self) -> None:
+        self._interactive_render_timer.stop()
+        self._cached_qimage = None
+        self._cached_key = None
+
+    def _build_preview_basemap_levels(self, image):
+        levels = []
+        for target_width in (512, 1024, 2048, 4096):
+            if image.width <= target_width:
+                continue
+            target_height = max(1, int(round(image.height * (target_width / image.width))))
+            levels.append(image.resize((target_width, target_height), resample=Image.Resampling.BILINEAR))
+        levels.append(image)
+        return levels
+
+    def _select_preview_basemap(self, layout: dict[str, float]):
+        desired_width = max(256, int(round(layout["draw_w"] * 1.35)))
+        for image in self._preview_basemap_levels:
+            if image.width >= desired_width:
+                return image
+        return self._preview_basemap_levels[-1]
+
+    def _render_now(self) -> None:
         self.invalidate_cache()
         self.update()
 
-    def invalidate_cache(self) -> None:
-        self._cached_qimage = None
-        self._cached_key = None
+    def _schedule_interactive_render(self) -> None:
+        target_interval = 1.0 / 30.0
+        elapsed = time.perf_counter() - self._last_render_time
+        if elapsed >= target_interval and not self._interactive_render_timer.isActive():
+            self._render_now()
+            return
+        delay_ms = max(1, int(round(max(0.0, target_interval - elapsed) * 1000.0)))
+        self._interactive_render_timer.start(delay_ms)
 
     def begin_polygon_draw(self, target_layer_id: str | None = None) -> None:
         self.draw_kind = "polygon"
@@ -129,6 +164,8 @@ class MapCanvas(QWidget):
 
     def paintEvent(self, _event) -> None:
         frame_size = (max(2, self.width()), max(2, self.height()))
+        layout = compute_map_layout(frame_size, self.basemap_image.size, self.project.view)
+        preview_basemap = self._select_preview_basemap(layout)
         key = (
             frame_size,
             self.frame_index,
@@ -141,11 +178,13 @@ class MapCanvas(QWidget):
             tuple((layer.id, layer.visible, len(layer.keyframes)) for layer in self.project.polygon_layers),
             tuple((layer.id, layer.visible, layer.start_frame, layer.end_frame, len(layer.points)) for layer in self.project.route_layers),
             self.basemap_image.size,
+            preview_basemap.size,
         )
         if self._cached_qimage is None or self._cached_key != key:
             image = render_frame(
                 self.project,
                 basemap_image=self.basemap_image,
+                display_basemap_image=preview_basemap,
                 frame_index=self.frame_index,
                 output_size=frame_size,
                 font_path=self.font_path,
@@ -153,7 +192,8 @@ class MapCanvas(QWidget):
             )
             self._cached_qimage = _pil_to_qimage(image)
             self._cached_key = key
-        self._last_layout = compute_map_layout(frame_size, self.basemap_image.size, self.project.view)
+            self._last_render_time = time.perf_counter()
+        self._last_layout = layout
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -225,9 +265,7 @@ class MapCanvas(QWidget):
             screen_y = new_layout["offset_y"] + world_y * new_layout["scale"]
             self.project.view.offset_x += x - screen_x
             self.project.view.offset_y += y - screen_y
-        self.invalidate_cache()
-        self.viewChanged.emit()
-        self.update()
+        self._schedule_interactive_render()
 
     def _finish_drawing(self) -> None:
         if self.draw_kind == "polygon" and len(self.temp_points) >= 3:
@@ -276,9 +314,7 @@ class MapCanvas(QWidget):
             self.project.view.offset_x += dx
             self.project.view.offset_y += dy
             self.last_mouse_pos = (pos.x(), pos.y())
-            self.invalidate_cache()
-            self.viewChanged.emit()
-            self.update()
+            self._schedule_interactive_render()
 
     def mouseReleaseEvent(self, _event) -> None:
         self.is_panning = False
@@ -458,7 +494,6 @@ class MainWindow(QMainWindow):
         self.fps_spin.valueChanged.connect(self._apply_project_form)
         self.fog_spin.valueChanged.connect(self._apply_project_form)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
-        self.canvas.viewChanged.connect(self._refresh_canvas_only)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._advance_frame)
 

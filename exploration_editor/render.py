@@ -222,6 +222,7 @@ def _draw_legend(
 def render_frame(
     project: Project,
     basemap_image: Image.Image | None = None,
+    display_basemap_image: Image.Image | None = None,
     frame_index: int = 0,
     output_size: tuple[int, int] | None = None,
     font_path: str | Path | None = None,
@@ -232,7 +233,12 @@ def render_frame(
     frame_w, frame_h = output_size
     if basemap_image is None:
         basemap_image = load_basemap_image(project.basemap_path)
-    basemap_image = basemap_image.convert("RGB")
+    if basemap_image.mode != "RGB":
+        basemap_image = basemap_image.convert("RGB")
+    if display_basemap_image is None:
+        display_basemap_image = basemap_image
+    elif display_basemap_image.mode != "RGB":
+        display_basemap_image = display_basemap_image.convert("RGB")
 
     layout = compute_map_layout((frame_w, frame_h), basemap_image.size, project.view)
     background = Image.new("RGB", (frame_w, frame_h), tuple(project.fog_color[:3]))
@@ -240,7 +246,7 @@ def render_frame(
     draw_w = max(1, int(round(layout["draw_w"])))
     draw_h = max(1, int(round(layout["draw_h"])))
     resample = Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS
-    scaled_map = basemap_image.resize((draw_w, draw_h), resample=resample)
+    scaled_map = display_basemap_image.resize((draw_w, draw_h), resample=resample)
     background.paste(scaled_map, (int(round(layout["offset_x"])), int(round(layout["offset_y"]))))
 
     map_mask = _build_map_mask((frame_w, frame_h), layout)
