@@ -14,7 +14,7 @@ The repo is intentionally separate from RisingSeaLevel and Tsunami. It reuses on
 - Dark fog-of-war overlay with feathered reveal masks
 - Legend for active routes
 - PNG export
-- MP4 export through FFmpeg
+- MP4 export through FFmpeg with RisingSeaLevel-style fade in/out, 3 second end hold, and optional soundtrack muxing
 - Helper script to build a static world basemap from a world DEM
 
 ## Repo Layout
@@ -61,12 +61,16 @@ Headless export without opening the editor:
 python render_project.py --project examples\age_of_discovery_demo.json
 ```
 
-This writes an MP4 to `exports\age_of_discovery_demo.mp4` by default.
+This writes an MP4 to `C:\Projekte\YouTube\GEOPANDA\exploration\exports\age_of_discovery_demo.mp4` by default.
+
+New project JSON files created from the editor are saved to `C:\Projekte\YouTube\GEOPANDA\exploration\examples` by default.
+
+If `C:\Projekte\YouTube\GEOPANDA\sound\soundtrack` exists, the export automatically picks a random MP3, adds a 2 second audio fade-in, keeps the last map frame on screen for 3 seconds, and fades both picture and music out at the end. You can override the soundtrack folder with `EXPLORATION_EDITOR_SOUNDTRACK_DIR`.
 
 Quick test render with smaller output and shorter duration:
 
 ```powershell
-python render_project.py --project examples\age_of_discovery_demo.json --output exports\age_of_discovery_test.mp4 --width 960 --height 540 --fps 24 --duration 6
+python render_project.py --project examples\age_of_discovery_demo.json --output C:\Projekte\YouTube\GEOPANDA\exploration\exports\age_of_discovery_test.mp4 --width 960 --height 540 --fps 24 --duration 6
 ```
 
 Useful overrides:

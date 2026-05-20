@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 import sys
 import time
@@ -33,7 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from exploration_editor.basemap import load_basemap_image, repo_root
-from exploration_editor.export import export_frame_png, export_video
+from exploration_editor.export import export_frame_count, export_frame_png, export_video
 from exploration_editor.geometry import (
     clamp,
     lonlat_to_world,
@@ -44,6 +45,7 @@ from exploration_editor.geometry import (
     unwrap_longitudes,
 )
 from exploration_editor.model import DEFAULT_BASEMAP_PATH, PolygonKeyframe, PolygonLayer, Project, RouteLayer, default_project, load_project, save_project
+from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
 from exploration_editor.render import clamp_view_state, compute_map_layout, render_frame
 
 
@@ -95,6 +97,7 @@ class MapCanvas(QWidget):
         self.hover_point: list[float] | None = None
         self._dragging_vertex_index: int | None = None
         self._selected_vertex_index: int | None = None
+        self._preserve_interpolated_overlay_during_drag = False
         self.show_edit_overlays = True
         self.is_panning = False
         self.last_mouse_pos: tuple[float, float] | None = None
@@ -102,6 +105,7 @@ class MapCanvas(QWidget):
         self._cached_qimage: QImage | None = None
         self._cached_key: tuple[object, ...] | None = None
         self._last_render_time = 0.0
+        self.playback_active = False
         self._interactive_render_timer = QTimer(self)
         self._interactive_render_timer.setSingleShot(True)
         self._interactive_render_timer.timeout.connect(self._render_now)
@@ -123,24 +127,34 @@ class MapCanvas(QWidget):
 
     def set_frame_index(self, frame_index: int) -> None:
         self.frame_index = max(0, min(project_frame_max(self.project), int(frame_index)))
+        self._preserve_interpolated_overlay_during_drag = False
         self._render_now()
 
     def set_selected_polygon_layer(self, layer_id: str | None) -> None:
         self.selected_polygon_layer_id = layer_id
         self._dragging_vertex_index = None
         self._selected_vertex_index = None
+        self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
     def set_show_edit_overlays(self, show_edit_overlays: bool) -> None:
         self.show_edit_overlays = bool(show_edit_overlays)
         self._dragging_vertex_index = None
         self._selected_vertex_index = None
+        self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
     def invalidate_cache(self) -> None:
         self._interactive_render_timer.stop()
         self._cached_qimage = None
         self._cached_key = None
+
+    def set_playback_active(self, playback_active: bool) -> None:
+        playback_active = bool(playback_active)
+        if self.playback_active == playback_active:
+            return
+        self.playback_active = playback_active
+        self._render_now()
 
     def _build_preview_basemap_levels(self, image):
         levels = []
@@ -152,8 +166,24 @@ class MapCanvas(QWidget):
         levels.append(image)
         return levels
 
-    def _select_preview_basemap(self, layout: dict[str, float]):
-        desired_width = max(256, int(round(layout["draw_w"] * 1.35)))
+    def _preview_render_size(self, frame_size: tuple[int, int]) -> tuple[int, int]:
+        frame_w, frame_h = frame_size
+        scale = 1.0
+        if self.playback_active:
+            scale = 0.5
+        elif self.is_panning:
+            scale = 0.6
+        elif self._interactive_render_timer.isActive():
+            scale = 0.75
+        if scale >= 0.999:
+            return frame_size
+        return (
+            min(frame_w, max(320, int(round(frame_w * scale)))),
+            min(frame_h, max(180, int(round(frame_h * scale)))),
+        )
+
+    def _select_preview_basemap(self, layout: dict[str, float], preview_frame_size: tuple[int, int]):
+        desired_width = max(256, int(round(preview_frame_size[0] * 1.2)))
         for image in self._preview_basemap_levels:
             if image.width >= desired_width:
                 return image
@@ -280,6 +310,14 @@ class MapCanvas(QWidget):
             if len(keyframe.points) != target_count:
                 keyframe.points = resample_path(keyframe.points, target_count, closed=True)
 
+    def _sync_polygon_keyframe_topology_from_frame(self, layer: PolygonLayer, point_count: int, frame: int) -> None:
+        target_count = max(3, int(point_count))
+        for keyframe in layer.keyframes:
+            if int(keyframe.frame) < int(frame):
+                continue
+            if len(keyframe.points) != target_count:
+                keyframe.points = resample_path(keyframe.points, target_count, closed=True)
+
     def insert_selected_polygon_vertex(self, x: float, y: float) -> bool:
         if self.draw_kind or not self.show_edit_overlays:
             return False
@@ -294,10 +332,12 @@ class MapCanvas(QWidget):
         keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
         if len(keyframe.points) < 3:
             return False
-        self._sync_polygon_keyframe_topology(layer, len(keyframe.points))
+        self._sync_polygon_keyframe_topology_from_frame(layer, len(keyframe.points), self.frame_index)
 
         edge_index, edge_t = edge_match
         for polygon_keyframe in layer.keyframes:
+            if int(polygon_keyframe.frame) < int(self.frame_index):
+                continue
             points = polygon_keyframe.points
             if len(points) < 3:
                 continue
@@ -321,9 +361,11 @@ class MapCanvas(QWidget):
         if len(keyframe.points) <= 3 or not (0 <= self._selected_vertex_index < len(keyframe.points)):
             return False
 
-        self._sync_polygon_keyframe_topology(layer, len(keyframe.points))
+        self._sync_polygon_keyframe_topology_from_frame(layer, len(keyframe.points), self.frame_index)
         delete_index = self._selected_vertex_index
         for polygon_keyframe in layer.keyframes:
+            if int(polygon_keyframe.frame) < int(self.frame_index):
+                continue
             if len(polygon_keyframe.points) > 3 and delete_index < len(polygon_keyframe.points):
                 polygon_keyframe.points.pop(delete_index)
 
@@ -357,14 +399,31 @@ class MapCanvas(QWidget):
         self.temp_points = []
         self.hover_point = None
         self._dragging_vertex_index = None
+        self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
     def paintEvent(self, _event) -> None:
         frame_size = (max(2, self.width()), max(2, self.height()))
         layout = compute_map_layout(frame_size, self.basemap_image.size, self.project.view)
-        preview_basemap = self._select_preview_basemap(layout)
+        freeze_preview = self._dragging_vertex_index is not None and self._cached_qimage is not None
+        preview_frame_size = self._preview_render_size(frame_size)
+        render_project = self.project
+        if preview_frame_size != frame_size:
+            scale_x = preview_frame_size[0] / float(frame_size[0])
+            scale_y = preview_frame_size[1] / float(frame_size[1])
+            render_project = replace(
+                self.project,
+                view=replace(
+                    self.project.view,
+                    offset_x=float(self.project.view.offset_x) * scale_x,
+                    offset_y=float(self.project.view.offset_y) * scale_y,
+                ),
+            )
+        preview_layout = compute_map_layout(preview_frame_size, self.basemap_image.size, render_project.view)
+        preview_basemap = self._select_preview_basemap(preview_layout, preview_frame_size)
         key = (
             frame_size,
+            preview_frame_size,
             self.frame_index,
             round(self.project.view.zoom, 4),
             round(self.project.view.offset_x, 2),
@@ -377,13 +436,13 @@ class MapCanvas(QWidget):
             self.basemap_image.size,
             preview_basemap.size,
         )
-        if self._cached_qimage is None or self._cached_key != key:
+        if not freeze_preview and (self._cached_qimage is None or self._cached_key != key):
             image = render_frame(
-                self.project,
+                render_project,
                 basemap_image=self.basemap_image,
                 display_basemap_image=preview_basemap,
                 frame_index=self.frame_index,
-                output_size=frame_size,
+                output_size=preview_frame_size,
                 font_path=self.font_path,
                 preview=True,
             )
@@ -410,6 +469,9 @@ class MapCanvas(QWidget):
             return
 
         is_exact_keyframe = self._find_polygon_keyframe(layer, self.frame_index) is not None
+        show_exact_keyframe = is_exact_keyframe and not (
+            self._dragging_vertex_index is not None and self._preserve_interpolated_overlay_during_drag
+        )
         outline = QColor(layer.color[0], layer.color[1], layer.color[2], 235)
         handle_outer = QColor(6, 8, 12, 220)
         handle_inner = QColor(245, 248, 252, 235)
@@ -418,7 +480,7 @@ class MapCanvas(QWidget):
 
         pen = QPen(outline)
         pen.setWidth(3)
-        if not is_exact_keyframe:
+        if not show_exact_keyframe:
             pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -547,17 +609,20 @@ class MapCanvas(QWidget):
             if handle_index is not None:
                 layer = self._selected_polygon_layer()
                 if layer is not None:
+                    had_exact_keyframe = self._find_polygon_keyframe(layer, self.frame_index) is not None
                     keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
                     if 0 <= handle_index < len(keyframe.points):
                         self._selected_vertex_index = handle_index
                         self._dragging_vertex_index = handle_index
+                        self._preserve_interpolated_overlay_during_drag = not had_exact_keyframe
+                        self._interactive_render_timer.stop()
                         point = self._screen_to_lonlat(pos.x(), pos.y())
                         if point is not None:
                             keyframe.points[handle_index] = point
-                        self._schedule_interactive_render()
                         self.update()
                         return
             self._selected_vertex_index = None
+            self._preserve_interpolated_overlay_during_drag = False
         if event.button() in {Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton}:
             self.is_panning = True
             self.last_mouse_pos = (pos.x(), pos.y())
@@ -585,7 +650,6 @@ class MapCanvas(QWidget):
                 keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
                 if 0 <= self._dragging_vertex_index < len(keyframe.points):
                     keyframe.points[self._dragging_vertex_index] = point
-                    self._schedule_interactive_render()
                     self.update()
             return
         if self.is_panning and self.last_mouse_pos is not None:
@@ -600,6 +664,7 @@ class MapCanvas(QWidget):
     def mouseReleaseEvent(self, _event) -> None:
         if self._dragging_vertex_index is not None:
             self._dragging_vertex_index = None
+            self._preserve_interpolated_overlay_during_drag = False
             self._render_now()
         self.is_panning = False
         self.last_mouse_pos = None
@@ -629,9 +694,15 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_project_path: str | None = None) -> None:
         super().__init__()
         self.repo_root = repo_root()
+        self.examples_root = exploration_examples_dir()
+        self.exports_root = exploration_exports_dir()
+        self.examples_root.mkdir(parents=True, exist_ok=True)
+        self.exports_root.mkdir(parents=True, exist_ok=True)
         self.font_path = self.repo_root / "fonts" / "Montserrat-ExtraBold.ttf"
         self.project_path: str | None = None
         self.project = default_project(str(self.repo_root / DEFAULT_BASEMAP_PATH))
+        self._playback_start_time: float | None = None
+        self._playback_start_frame = 0
         self._updating_form = False
         self._build_ui()
         self._connect_signals()
@@ -924,7 +995,7 @@ class MainWindow(QMainWindow):
         self._reset_project(default_project(basemap), None)
 
     def _open_project(self) -> None:
-        path, _filter = QFileDialog.getOpenFileName(self, "Open Project", str(self.repo_root / "examples"), "JSON Files (*.json)")
+        path, _filter = QFileDialog.getOpenFileName(self, "Open Project", str(self.examples_root), "JSON Files (*.json)")
         if path:
             self._load_project_from_path(path)
 
@@ -933,12 +1004,15 @@ class MainWindow(QMainWindow):
         basemap_path = Path(project.basemap_path)
         if not basemap_path.is_absolute():
             project.basemap_path = str((Path(path).resolve().parent / basemap_path).resolve())
-        self._reset_project(project, path)
+        loaded_path = Path(path).resolve()
+        bundled_examples_dir = (self.repo_root / "examples").resolve()
+        project_path = None if bundled_examples_dir in loaded_path.parents else path
+        self._reset_project(project, project_path)
 
     def _save_project(self) -> None:
         if self.project_path is None:
             default_name = self.project.title.lower().replace(" ", "_") or "exploration_project"
-            path, _filter = QFileDialog.getSaveFileName(self, "Save Project", str(self.repo_root / "examples" / f"{default_name}.json"), "JSON Files (*.json)")
+            path, _filter = QFileDialog.getSaveFileName(self, "Save Project", str(self.examples_root / f"{default_name}.json"), "JSON Files (*.json)")
             if not path:
                 return
             self.project_path = path
@@ -1174,7 +1248,7 @@ class MainWindow(QMainWindow):
         self.timeline_slider.setValue(current)
         self.timeline_slider.blockSignals(False)
         self.timeline_label.setText(f"Frame {current} / {project_frame_max(self.project)}")
-        self.play_timer.setInterval(int(round(1000.0 / max(1, self.project.fps))))
+        self.play_timer.setInterval(16)
 
     def _on_frame_changed(self, value: int) -> None:
         self.timeline_label.setText(f"Frame {value} / {project_frame_max(self.project)}")
@@ -1188,31 +1262,45 @@ class MainWindow(QMainWindow):
     def _toggle_play(self) -> None:
         if self.play_timer.isActive():
             self.play_timer.stop()
+            self._playback_start_time = None
+            self.canvas.set_playback_active(False)
             self.play_button.setText("Play")
         else:
+            self._playback_start_time = time.perf_counter()
+            self._playback_start_frame = self.timeline_slider.value()
+            self.canvas.set_playback_active(True)
             self.play_timer.start()
             self.play_button.setText("Pause")
 
     def _advance_frame(self) -> None:
-        current = self.timeline_slider.value()
-        if current >= project_frame_max(self.project):
+        if self._playback_start_time is None:
+            return
+        max_frame = project_frame_max(self.project)
+        elapsed = max(0.0, time.perf_counter() - self._playback_start_time)
+        target_frame = self._playback_start_frame + int(elapsed * max(1, self.project.fps))
+        if target_frame >= max_frame:
             self.play_timer.stop()
+            self._playback_start_time = None
+            self.canvas.set_playback_active(False)
+            self.timeline_slider.setValue(max_frame)
             self.play_button.setText("Play")
             return
-        self.timeline_slider.setValue(current + 1)
+        if target_frame != self.timeline_slider.value():
+            self.timeline_slider.setValue(target_frame)
 
     def _export_png(self) -> None:
-        path, _filter = QFileDialog.getSaveFileName(self, "Export PNG", str(self.repo_root / "exports" / "preview.png"), "PNG Files (*.png)")
+        path, _filter = QFileDialog.getSaveFileName(self, "Export PNG", str(self.exports_root / "preview.png"), "PNG Files (*.png)")
         if not path:
             return
         export_frame_png(self.project, self.canvas.basemap_image, self.timeline_slider.value(), path, font_path=self.font_path)
         self.statusBar().showMessage(f"PNG exported: {path}", 4000)
 
     def _export_video(self) -> None:
-        path, _filter = QFileDialog.getSaveFileName(self, "Export MP4", str(self.repo_root / "exports" / "exploration_video.mp4"), "MP4 Files (*.mp4)")
+        path, _filter = QFileDialog.getSaveFileName(self, "Export MP4", str(self.exports_root / "exploration_video.mp4"), "MP4 Files (*.mp4)")
         if not path:
             return
-        progress = QProgressDialog("Exporting video...", None, 0, self.project.frame_count, self)
+        total_frames = export_frame_count(self.project)
+        progress = QProgressDialog("Exporting video...", None, 0, total_frames, self)
         progress.setWindowTitle("Export")
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -1227,7 +1315,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Export Failed", str(exc))
             return
-        progress.setValue(self.project.frame_count)
+        progress.setValue(total_frames)
         self.statusBar().showMessage(f"MP4 exported: {path}", 4000)
 
     def _update_export_progress(self, dialog: QProgressDialog, done: int, total: int) -> None:

@@ -7,6 +7,7 @@ import time
 from exploration_editor.basemap import load_basemap_image, repo_root
 from exploration_editor.export import export_video
 from exploration_editor.model import load_project, resolve_project_path
+from exploration_editor.paths import exploration_exports_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=None,
-        help="Optional output MP4 path. Defaults to exports/<project-name>.mp4.",
+        help="Optional output MP4 path. Defaults to C:/Projekte/YouTube/GEOPANDA/exploration/exports/<project-name>.mp4.",
     )
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -41,7 +42,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _default_output_path(project_path: Path) -> Path:
-    return repo_root() / "exports" / f"{project_path.stem}.mp4"
+    return exploration_exports_dir() / f"{project_path.stem}.mp4"
 
 
 def _default_font_path() -> Path | None:
