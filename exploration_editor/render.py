@@ -10,6 +10,39 @@ from exploration_editor.geometry import lonlat_to_world, path_prefix, polygon_po
 from exploration_editor.model import Project, RouteLayer, ViewState
 
 
+def clamp_view_state(
+    frame_size: tuple[int, int],
+    world_size: tuple[int, int],
+    view: ViewState,
+) -> ViewState:
+    frame_w, frame_h = frame_size
+    world_w, world_h = world_size
+    base_scale = max(frame_w / float(world_w), frame_h / float(world_h))
+    zoom = max(1.0, float(view.zoom))
+    scale = max(0.05, base_scale * zoom)
+    draw_w = world_w * scale
+    draw_h = world_h * scale
+    center_x = (frame_w - draw_w) * 0.5
+    center_y = (frame_h - draw_h) * 0.5
+    offset_x = center_x + float(view.offset_x)
+    offset_y = center_y + float(view.offset_y)
+
+    if draw_w >= frame_w:
+        offset_x = min(0.0, max(frame_w - draw_w, offset_x))
+    else:
+        offset_x = center_x
+    if draw_h >= frame_h:
+        offset_y = min(0.0, max(frame_h - draw_h, offset_y))
+    else:
+        offset_y = center_y
+
+    return ViewState(
+        zoom=zoom,
+        offset_x=offset_x - center_x,
+        offset_y=offset_y - center_y,
+    )
+
+
 def compute_map_layout(
     frame_size: tuple[int, int],
     world_size: tuple[int, int],
@@ -17,12 +50,13 @@ def compute_map_layout(
 ) -> dict[str, float]:
     frame_w, frame_h = frame_size
     world_w, world_h = world_size
-    base_scale = min(frame_w / float(world_w), frame_h / float(world_h))
-    scale = max(0.05, base_scale * max(0.05, float(view.zoom)))
+    clamped_view = clamp_view_state(frame_size, world_size, view)
+    base_scale = max(frame_w / float(world_w), frame_h / float(world_h))
+    scale = max(0.05, base_scale * max(1.0, float(clamped_view.zoom)))
     draw_w = world_w * scale
     draw_h = world_h * scale
-    offset_x = (frame_w - draw_w) * 0.5 + float(view.offset_x)
-    offset_y = (frame_h - draw_h) * 0.5 + float(view.offset_y)
+    offset_x = (frame_w - draw_w) * 0.5 + float(clamped_view.offset_x)
+    offset_y = (frame_h - draw_h) * 0.5 + float(clamped_view.offset_y)
     return {
         "frame_w": frame_w,
         "frame_h": frame_h,

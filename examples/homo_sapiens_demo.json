@@ -6,7 +6,7 @@
   "duration_sec": 16.0,
   "fog_opacity": 0.78,
   "fog_color": [20, 26, 34],
-  "basemap_path": "../data/basemaps/world_etopo_8192.jpg",
+  "basemap_path": "../data/basemaps/world_natural_earth_ii_8192.jpg",
   "view": {
     "zoom": 1.0,
     "offset_x": 0.0,

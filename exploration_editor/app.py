@@ -43,8 +43,8 @@ from exploration_editor.geometry import (
     world_to_lonlat,
     unwrap_longitudes,
 )
-from exploration_editor.model import PolygonKeyframe, PolygonLayer, Project, RouteLayer, default_project, load_project, save_project
-from exploration_editor.render import compute_map_layout, render_frame
+from exploration_editor.model import DEFAULT_BASEMAP_PATH, PolygonKeyframe, PolygonLayer, Project, RouteLayer, default_project, load_project, save_project
+from exploration_editor.render import clamp_view_state, compute_map_layout, render_frame
 
 
 POLYGON_COLORS = [
@@ -59,6 +59,11 @@ ROUTE_COLORS = [
     [255, 196, 138],
     [255, 140, 140],
     [238, 180, 255],
+]
+VIDEO_FORMAT_PRESETS = [
+    ("Full HD 1080p (1920x1080)", (1920, 1080)),
+    ("QHD 1440p (2560x1440)", (2560, 1440)),
+    ("4K UHD 2160p (3840x2160)", (3840, 2160)),
 ]
 
 
@@ -113,6 +118,7 @@ class MapCanvas(QWidget):
     def load_basemap(self, basemap_path: str | None) -> None:
         self.basemap_image = load_basemap_image(basemap_path)
         self._preview_basemap_levels = self._build_preview_basemap_levels(self.basemap_image)
+        self._constrain_view()
         self._render_now()
 
     def set_frame_index(self, frame_index: int) -> None:
@@ -165,6 +171,16 @@ class MapCanvas(QWidget):
             return
         delay_ms = max(1, int(round(max(0.0, target_interval - elapsed) * 1000.0)))
         self._interactive_render_timer.start(delay_ms)
+
+    def _constrain_view(self) -> None:
+        normalized = clamp_view_state(
+            (max(2, self.width()), max(2, self.height())),
+            self.basemap_image.size,
+            self.project.view,
+        )
+        self.project.view.zoom = normalized.zoom
+        self.project.view.offset_x = normalized.offset_x
+        self.project.view.offset_y = normalized.offset_y
 
     def _selected_polygon_layer(self) -> PolygonLayer | None:
         if not self.selected_polygon_layer_id:
@@ -479,7 +495,7 @@ class MapCanvas(QWidget):
     def _zoom_at(self, x: float, y: float, factor: float) -> None:
         before = self._screen_to_lonlat(x, y)
         old_zoom = self.project.view.zoom
-        self.project.view.zoom = clamp(old_zoom * factor, 0.3, 14.0)
+        self.project.view.zoom = clamp(old_zoom * factor, 1.0, 14.0)
         if before is not None:
             new_layout = compute_map_layout((max(2, self.width()), max(2, self.height())), self.basemap_image.size, self.project.view)
             world_x, world_y = lonlat_to_world(before[0], before[1], self.basemap_image.size)
@@ -487,6 +503,7 @@ class MapCanvas(QWidget):
             screen_y = new_layout["offset_y"] + world_y * new_layout["scale"]
             self.project.view.offset_x += x - screen_x
             self.project.view.offset_y += y - screen_y
+        self._constrain_view()
         self._schedule_interactive_render()
 
     def _finish_drawing(self) -> None:
@@ -553,6 +570,7 @@ class MapCanvas(QWidget):
                 dy = pos.y() - self.last_mouse_pos[1]
                 self.project.view.offset_x += dx
                 self.project.view.offset_y += dy
+                self._constrain_view()
                 self.last_mouse_pos = (pos.x(), pos.y())
                 self._schedule_interactive_render()
             return
@@ -575,6 +593,7 @@ class MapCanvas(QWidget):
             dy = pos.y() - self.last_mouse_pos[1]
             self.project.view.offset_x += dx
             self.project.view.offset_y += dy
+            self._constrain_view()
             self.last_mouse_pos = (pos.x(), pos.y())
             self._schedule_interactive_render()
 
@@ -600,6 +619,11 @@ class MapCanvas(QWidget):
         factor = 1.12 if event.angleDelta().y() > 0 else 1.0 / 1.12
         self._zoom_at(event.position().x(), event.position().y(), factor)
 
+    def resizeEvent(self, event) -> None:
+        self._constrain_view()
+        self._render_now()
+        super().resizeEvent(event)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, initial_project_path: str | None = None) -> None:
@@ -607,7 +631,7 @@ class MainWindow(QMainWindow):
         self.repo_root = repo_root()
         self.font_path = self.repo_root / "fonts" / "Montserrat-ExtraBold.ttf"
         self.project_path: str | None = None
-        self.project = default_project(str(self.repo_root / "data" / "basemaps" / "world_etopo_8192.jpg"))
+        self.project = default_project(str(self.repo_root / DEFAULT_BASEMAP_PATH))
         self._updating_form = False
         self._build_ui()
         self._connect_signals()
@@ -679,11 +703,13 @@ class MainWindow(QMainWindow):
         self.fog_spin = QDoubleSpinBox()
         self.fog_spin.setRange(0.0, 1.0)
         self.fog_spin.setSingleStep(0.02)
+        self.video_format_combo = QComboBox()
         self.basemap_combo = QComboBox()
         project_form.addRow("Title", self.title_edit)
         project_form.addRow("Duration", self.duration_spin)
         project_form.addRow("FPS", self.fps_spin)
         project_form.addRow("Fog Opacity", self.fog_spin)
+        project_form.addRow("Video Format", self.video_format_combo)
         project_form.addRow("Basemap", self.basemap_combo)
         side_layout.addWidget(project_box)
 
@@ -772,6 +798,7 @@ class MainWindow(QMainWindow):
         self.duration_spin.valueChanged.connect(self._apply_project_form)
         self.fps_spin.valueChanged.connect(self._apply_project_form)
         self.fog_spin.valueChanged.connect(self._apply_project_form)
+        self.video_format_combo.currentIndexChanged.connect(self._apply_video_format_selection)
         self.basemap_combo.currentIndexChanged.connect(self._apply_basemap_selection)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
         self.play_timer = QTimer(self)
@@ -784,6 +811,37 @@ class MainWindow(QMainWindow):
         self.canvas.set_show_edit_overlays(not enabled)
         mode_text = "final preview" if enabled else "edit overlay"
         self.statusBar().showMessage(f"Viewer mode: {mode_text}", 2500)
+
+    def _refresh_video_format_selector(self) -> None:
+        current_size = (int(self.project.width), int(self.project.height))
+        self.video_format_combo.blockSignals(True)
+        self.video_format_combo.clear()
+
+        current_index = -1
+        for index, (label, size) in enumerate(VIDEO_FORMAT_PRESETS):
+            self.video_format_combo.addItem(label, size)
+            if size == current_size:
+                current_index = index
+
+        if current_index < 0:
+            self.video_format_combo.addItem(f"Custom ({current_size[0]}x{current_size[1]})", current_size)
+            current_index = self.video_format_combo.count() - 1
+
+        self.video_format_combo.setCurrentIndex(current_index)
+        self.video_format_combo.blockSignals(False)
+
+    def _apply_video_format_selection(self, _index: int) -> None:
+        if self._updating_form:
+            return
+        size = self.video_format_combo.currentData()
+        if not size:
+            return
+        width, height = int(size[0]), int(size[1])
+        if width == self.project.width and height == self.project.height:
+            return
+        self.project.width = width
+        self.project.height = height
+        self.statusBar().showMessage(f"Video format set: {width}x{height}", 2500)
 
     def _available_basemap_paths(self) -> list[Path]:
         basemap_dir = self.repo_root / "data" / "basemaps"
@@ -862,7 +920,7 @@ class MainWindow(QMainWindow):
         self._populate_layer_form()
 
     def _new_project(self) -> None:
-        basemap = str(self.repo_root / "data" / "basemaps" / "world_etopo_8192.jpg")
+        basemap = str(self.repo_root / DEFAULT_BASEMAP_PATH)
         self._reset_project(default_project(basemap), None)
 
     def _open_project(self) -> None:
@@ -942,6 +1000,7 @@ class MainWindow(QMainWindow):
         self.duration_spin.setValue(float(self.project.duration_sec))
         self.fps_spin.setValue(int(self.project.fps))
         self.fog_spin.setValue(float(self.project.fog_opacity))
+        self._refresh_video_format_selector()
         self._refresh_basemap_selector()
         self._updating_form = False
 

@@ -8,7 +8,7 @@ from typing import Any
 import uuid
 
 
-DEFAULT_BASEMAP_PATH = "data/basemaps/world_etopo_8192.jpg"
+DEFAULT_BASEMAP_PATH = "data/basemaps/world_natural_earth_ii_8192.jpg"
 
 
 def _uid(prefix: str) -> str:
