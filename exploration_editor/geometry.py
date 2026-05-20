@@ -87,18 +87,142 @@ def resample_path(points: list[list[float]], sample_count: int, closed: bool = F
     return samples
 
 
-def interpolate_paths(points_a: list[list[float]], points_b: list[list[float]], t: float, closed: bool = False) -> list[list[float]]:
+def _wrap_longitude(lon: float) -> float:
+    wrapped = ((float(lon) + 180.0) % 360.0) - 180.0
+    if wrapped == -180.0 and float(lon) > 0.0:
+        return 180.0
+    return wrapped
+
+
+def _interpolate_matched_points(points_a: list[list[float]], points_b: list[list[float]], t: float) -> list[list[float]]:
+    left = unwrap_longitudes(points_a)
+    right = unwrap_longitudes(points_b)
+    blended: list[list[float]] = []
+    for point_a, point_b in zip(left, right):
+        lon_b = point_b[0]
+        while lon_b - point_a[0] > 180.0:
+            lon_b -= 360.0
+        while lon_b - point_a[0] < -180.0:
+            lon_b += 360.0
+        blended.append(
+            [
+                _wrap_longitude(point_a[0] * (1.0 - t) + lon_b * t),
+                float(point_a[1] * (1.0 - t) + point_b[1] * t),
+            ]
+        )
+    return blended
+
+
+def interpolate_paths(
+    points_a: list[list[float]],
+    points_b: list[list[float]],
+    t: float,
+    closed: bool = False,
+    sample_count: int | None = None,
+) -> list[list[float]]:
     if not points_a:
         return [point[:] for point in points_b]
     if not points_b:
         return [point[:] for point in points_a]
 
     t = clamp(float(t), 0.0, 1.0)
-    sample_count = max(len(points_a), len(points_b), 96 if closed else 48)
+    if len(points_a) == len(points_b):
+        requested_samples = len(points_a) if sample_count is None else int(sample_count)
+        if requested_samples == len(points_a):
+            return _interpolate_matched_points(points_a, points_b, t)
+    if sample_count is None:
+        sample_count = max(len(points_a), len(points_b), 96 if closed else 48)
+    else:
+        sample_count = max(int(sample_count), 3 if closed else 2)
     path_a = np.asarray(resample_path(points_a, sample_count, closed=closed), dtype=np.float64)
     path_b = np.asarray(resample_path(points_b, sample_count, closed=closed), dtype=np.float64)
     blended = path_a * (1.0 - t) + path_b * t
     return [[float(point[0]), float(point[1])] for point in blended]
+
+
+def polygon_edit_points_at_frame(layer: PolygonLayer, frame: int) -> list[list[float]]:
+    if not layer.keyframes:
+        return []
+
+    keyframes = sorted(layer.keyframes, key=lambda item: item.frame)
+    if frame <= keyframes[0].frame:
+        return [point[:] for point in keyframes[0].points]
+    if frame >= keyframes[-1].frame:
+        return [point[:] for point in keyframes[-1].points]
+
+    for index in range(len(keyframes) - 1):
+        left = keyframes[index]
+        right = keyframes[index + 1]
+        if left.frame <= frame <= right.frame:
+            if frame == left.frame:
+                return [point[:] for point in left.points]
+            if frame == right.frame:
+                return [point[:] for point in right.points]
+            span = max(1, right.frame - left.frame)
+            t = (frame - left.frame) / span
+            sample_count = max(len(left.points), len(right.points), 3)
+            return interpolate_paths(
+                left.points,
+                right.points,
+                t,
+                closed=True,
+                sample_count=sample_count,
+            )
+    return [point[:] for point in keyframes[-1].points]
+
+
+def rounded_closed_path(points: Iterable[Iterable[float]], radius: float) -> list[tuple[float, float]]:
+    path = [(float(point[0]), float(point[1])) for point in points]
+    if len(path) < 3 or radius <= 0.0:
+        return path
+
+    def append_unique(target: list[tuple[float, float]], point: tuple[float, float]) -> None:
+        if not target:
+            target.append(point)
+            return
+        if math.hypot(target[-1][0] - point[0], target[-1][1] - point[1]) > 1e-6:
+            target.append(point)
+
+    rounded_segments: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float], int]] = []
+    for index, current in enumerate(path):
+        previous = path[index - 1]
+        following = path[(index + 1) % len(path)]
+
+        in_dx = previous[0] - current[0]
+        in_dy = previous[1] - current[1]
+        out_dx = following[0] - current[0]
+        out_dy = following[1] - current[1]
+        in_len = math.hypot(in_dx, in_dy)
+        out_len = math.hypot(out_dx, out_dy)
+        corner_radius = min(float(radius), in_len * 0.48, out_len * 0.48)
+
+        if corner_radius <= 1e-6 or in_len <= 1e-6 or out_len <= 1e-6:
+            rounded_segments.append((current, current, current, 1))
+            continue
+
+        start = (current[0] + (in_dx / in_len) * corner_radius, current[1] + (in_dy / in_len) * corner_radius)
+        end = (current[0] + (out_dx / out_len) * corner_radius, current[1] + (out_dy / out_len) * corner_radius)
+        steps = max(4, int(round(corner_radius / 4.0)))
+        rounded_segments.append((start, current, end, steps))
+
+    rounded_path: list[tuple[float, float]] = []
+    for start, control, end, steps in rounded_segments:
+        append_unique(rounded_path, start)
+        for step in range(1, steps):
+            t = step / float(steps)
+            one_minus_t = 1.0 - t
+            append_unique(
+                rounded_path,
+                (
+                    one_minus_t * one_minus_t * start[0] + 2.0 * one_minus_t * t * control[0] + t * t * end[0],
+                    one_minus_t * one_minus_t * start[1] + 2.0 * one_minus_t * t * control[1] + t * t * end[1],
+                ),
+            )
+        append_unique(rounded_path, end)
+
+    if len(rounded_path) > 1 and math.hypot(rounded_path[0][0] - rounded_path[-1][0], rounded_path[0][1] - rounded_path[-1][1]) <= 1e-6:
+        rounded_path.pop()
+    return rounded_path
 
 
 def polygon_points_at_frame(layer: PolygonLayer, frame: int) -> list[list[float]]:

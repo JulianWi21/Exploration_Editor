@@ -34,6 +34,7 @@ class PolygonLayer:
     name: str = "Reveal"
     color: list[int] = field(default_factory=lambda: [232, 241, 255])
     feather_px: int = 20
+    rounding_px: int = 18
     opacity: float = 1.0
     visible: bool = True
     keyframes: list[PolygonKeyframe] = field(default_factory=list)
@@ -109,6 +110,7 @@ def _polygon_from_dict(data: dict[str, Any]) -> PolygonLayer:
         name=str(data.get("name") or "Reveal"),
         color=[int(v) for v in data.get("color", [232, 241, 255])[:3]],
         feather_px=int(data.get("feather_px", 20)),
+        rounding_px=int(data.get("rounding_px", 18)),
         opacity=float(data.get("opacity", 1.0)),
         visible=bool(data.get("visible", True)),
         keyframes=keyframes,

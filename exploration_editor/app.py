@@ -33,7 +33,14 @@ from PyQt6.QtWidgets import (
 
 from exploration_editor.basemap import load_basemap_image, repo_root
 from exploration_editor.export import export_frame_png, export_video
-from exploration_editor.geometry import clamp, lonlat_to_world, world_to_lonlat, unwrap_longitudes
+from exploration_editor.geometry import (
+    clamp,
+    lonlat_to_world,
+    polygon_edit_points_at_frame,
+    rounded_closed_path,
+    world_to_lonlat,
+    unwrap_longitudes,
+)
 from exploration_editor.model import PolygonKeyframe, PolygonLayer, Project, RouteLayer, default_project, load_project, save_project
 from exploration_editor.render import compute_map_layout, render_frame
 
@@ -76,8 +83,10 @@ class MapCanvas(QWidget):
         self.frame_index = 0
         self.draw_kind: str | None = None
         self.target_layer_id: str | None = None
+        self.selected_polygon_layer_id: str | None = None
         self.temp_points: list[list[float]] = []
         self.hover_point: list[float] | None = None
+        self._dragging_vertex_index: int | None = None
         self.is_panning = False
         self.last_mouse_pos: tuple[float, float] | None = None
         self._last_layout: dict[str, float] | None = None
@@ -105,6 +114,11 @@ class MapCanvas(QWidget):
     def set_frame_index(self, frame_index: int) -> None:
         self.frame_index = max(0, min(project_frame_max(self.project), int(frame_index)))
         self._render_now()
+
+    def set_selected_polygon_layer(self, layer_id: str | None) -> None:
+        self.selected_polygon_layer_id = layer_id
+        self._dragging_vertex_index = None
+        self.update()
 
     def invalidate_cache(self) -> None:
         self._interactive_render_timer.stop()
@@ -140,6 +154,62 @@ class MapCanvas(QWidget):
             return
         delay_ms = max(1, int(round(max(0.0, target_interval - elapsed) * 1000.0)))
         self._interactive_render_timer.start(delay_ms)
+
+    def _selected_polygon_layer(self) -> PolygonLayer | None:
+        if not self.selected_polygon_layer_id:
+            return None
+        for layer in self.project.polygon_layers:
+            if layer.id == self.selected_polygon_layer_id:
+                return layer
+        return None
+
+    def _find_polygon_keyframe(self, layer: PolygonLayer, frame: int) -> PolygonKeyframe | None:
+        for keyframe in layer.keyframes:
+            if int(keyframe.frame) == int(frame):
+                return keyframe
+        return None
+
+    def _ensure_polygon_keyframe(self, layer: PolygonLayer, frame: int) -> PolygonKeyframe:
+        existing = self._find_polygon_keyframe(layer, frame)
+        if existing is not None:
+            return existing
+        keyframe = PolygonKeyframe(
+            frame=int(frame),
+            points=polygon_edit_points_at_frame(layer, int(frame)),
+        )
+        layer.keyframes.append(keyframe)
+        layer.keyframes.sort(key=lambda item: item.frame)
+        return keyframe
+
+    def _editable_polygon_points(self) -> list[list[float]]:
+        if self.draw_kind:
+            return []
+        layer = self._selected_polygon_layer()
+        if layer is None or not layer.visible:
+            return []
+        exact = self._find_polygon_keyframe(layer, self.frame_index)
+        if exact is not None:
+            return exact.points
+        return polygon_edit_points_at_frame(layer, self.frame_index)
+
+    def _nearest_editable_vertex(self, x: float, y: float) -> int | None:
+        if self._last_layout is None:
+            return None
+        points = self._editable_polygon_points()
+        if len(points) < 3:
+            return None
+        tolerance_px = max(8.0, self.height() * 0.012)
+        best_index: int | None = None
+        best_dist_sq = tolerance_px * tolerance_px
+        for path in self._screen_variants(points):
+            for index, (sx, sy) in enumerate(path):
+                dx = sx - x
+                dy = sy - y
+                dist_sq = dx * dx + dy * dy
+                if dist_sq <= best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_index = index
+        return best_index
 
     def begin_polygon_draw(self, target_layer_id: str | None = None) -> None:
         self.draw_kind = "polygon"
@@ -199,8 +269,42 @@ class MapCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self._cached_qimage is not None:
             painter.drawImage(self.rect(), self._cached_qimage)
+        self._draw_selected_polygon_overlay(painter)
         self._draw_temp_overlay(painter)
         painter.end()
+
+    def _draw_selected_polygon_overlay(self, painter: QPainter) -> None:
+        if self.draw_kind or self._last_layout is None:
+            return
+        layer = self._selected_polygon_layer()
+        points = self._editable_polygon_points()
+        if layer is None or len(points) < 3:
+            return
+
+        is_exact_keyframe = self._find_polygon_keyframe(layer, self.frame_index) is not None
+        outline = QColor(layer.color[0], layer.color[1], layer.color[2], 235)
+        handle_outer = QColor(6, 8, 12, 220)
+        handle_inner = QColor(245, 248, 252, 235)
+        active_handle = QColor(255, 208, 84, 245)
+
+        pen = QPen(outline)
+        pen.setWidth(3)
+        if not is_exact_keyframe:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        for path in self._screen_variants(points):
+            outline_path = rounded_closed_path(path, float(layer.rounding_px))
+            polygon = QPolygonF([QPointF(x, y) for x, y in outline_path])
+            painter.drawPolygon(polygon)
+            for index, (x, y) in enumerate(path):
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(active_handle if index == self._dragging_vertex_index else handle_outer)
+                painter.drawEllipse(QPointF(x, y), 5.5, 5.5)
+                painter.setBrush(handle_inner)
+                painter.drawEllipse(QPointF(x, y), 2.9, 2.9)
+                painter.setPen(pen)
 
     def _draw_temp_overlay(self, painter: QPainter) -> None:
         if not self.draw_kind or not self.temp_points or self._last_layout is None:
@@ -298,6 +402,20 @@ class MapCanvas(QWidget):
             else:
                 self.cancel_drawing()
             return
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle_index = self._nearest_editable_vertex(pos.x(), pos.y())
+            if handle_index is not None:
+                layer = self._selected_polygon_layer()
+                if layer is not None:
+                    keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
+                    if 0 <= handle_index < len(keyframe.points):
+                        self._dragging_vertex_index = handle_index
+                        point = self._screen_to_lonlat(pos.x(), pos.y())
+                        if point is not None:
+                            keyframe.points[handle_index] = point
+                        self._schedule_interactive_render()
+                        self.update()
+                        return
         if event.button() in {Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton}:
             self.is_panning = True
             self.last_mouse_pos = (pos.x(), pos.y())
@@ -308,6 +426,16 @@ class MapCanvas(QWidget):
             self.hover_point = self._screen_to_lonlat(pos.x(), pos.y())
             self.update()
             return
+        if self._dragging_vertex_index is not None:
+            point = self._screen_to_lonlat(pos.x(), pos.y())
+            layer = self._selected_polygon_layer()
+            if point is not None and layer is not None:
+                keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
+                if 0 <= self._dragging_vertex_index < len(keyframe.points):
+                    keyframe.points[self._dragging_vertex_index] = point
+                    self._schedule_interactive_render()
+                    self.update()
+            return
         if self.is_panning and self.last_mouse_pos is not None:
             dx = pos.x() - self.last_mouse_pos[0]
             dy = pos.y() - self.last_mouse_pos[1]
@@ -317,6 +445,9 @@ class MapCanvas(QWidget):
             self._schedule_interactive_render()
 
     def mouseReleaseEvent(self, _event) -> None:
+        if self._dragging_vertex_index is not None:
+            self._dragging_vertex_index = None
+            self._render_now()
         self.is_panning = False
         self.last_mouse_pos = None
 
@@ -425,6 +556,8 @@ class MainWindow(QMainWindow):
         self.color_button = QPushButton("Pick Color")
         self.feather_spin = QSpinBox()
         self.feather_spin.setRange(0, 240)
+        self.rounding_spin = QSpinBox()
+        self.rounding_spin.setRange(0, 240)
         self.opacity_spin = QDoubleSpinBox()
         self.opacity_spin.setRange(0.05, 1.0)
         self.opacity_spin.setSingleStep(0.05)
@@ -440,6 +573,7 @@ class MainWindow(QMainWindow):
         props_form.addRow("Visible", self.layer_visible_check)
         props_form.addRow("Color", self.color_button)
         props_form.addRow("Feather", self.feather_spin)
+        props_form.addRow("Rounding", self.rounding_spin)
         props_form.addRow("Opacity", self.opacity_spin)
         props_form.addRow("Route Width", self.route_width_spin)
         props_form.addRow("Reveal Width", self.route_reveal_spin)
@@ -482,6 +616,7 @@ class MainWindow(QMainWindow):
         self.layer_name_edit.editingFinished.connect(self._apply_layer_form)
         self.layer_visible_check.stateChanged.connect(self._apply_layer_form)
         self.feather_spin.valueChanged.connect(self._apply_layer_form)
+        self.rounding_spin.valueChanged.connect(self._apply_layer_form)
         self.opacity_spin.valueChanged.connect(self._apply_layer_form)
         self.route_width_spin.valueChanged.connect(self._apply_layer_form)
         self.route_reveal_spin.valueChanged.connect(self._apply_layer_form)
@@ -619,6 +754,7 @@ class MainWindow(QMainWindow):
 
     def _populate_layer_form(self) -> None:
         kind, layer = self._selected_layer()
+        self.canvas.set_selected_polygon_layer(layer.id if kind == "polygon" and layer is not None else None)
         self._updating_form = True
         enabled = layer is not None
         for widget in [
@@ -626,6 +762,7 @@ class MainWindow(QMainWindow):
             self.layer_visible_check,
             self.color_button,
             self.feather_spin,
+            self.rounding_spin,
             self.opacity_spin,
             self.route_width_spin,
             self.route_reveal_spin,
@@ -645,6 +782,7 @@ class MainWindow(QMainWindow):
         self._set_color_button(layer.color)
         is_polygon = kind == "polygon"
         self.feather_spin.setEnabled(is_polygon)
+        self.rounding_spin.setEnabled(is_polygon)
         self.opacity_spin.setEnabled(is_polygon)
         self.route_width_spin.setEnabled(not is_polygon)
         self.route_reveal_spin.setEnabled(not is_polygon)
@@ -656,6 +794,7 @@ class MainWindow(QMainWindow):
         self.route_end_spin.setMaximum(project_frame_max(self.project))
         if is_polygon:
             self.feather_spin.setValue(layer.feather_px)
+            self.rounding_spin.setValue(layer.rounding_px)
             self.opacity_spin.setValue(layer.opacity)
         else:
             self.route_width_spin.setValue(layer.width_px)
@@ -677,6 +816,7 @@ class MainWindow(QMainWindow):
         layer.color = list(self.color_button.property("rgb") or layer.color)
         if kind == "polygon":
             layer.feather_px = int(self.feather_spin.value())
+            layer.rounding_px = int(self.rounding_spin.value())
             layer.opacity = float(self.opacity_spin.value())
         else:
             layer.width_px = int(self.route_width_spin.value())

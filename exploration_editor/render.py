@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from exploration_editor.basemap import load_basemap_image
-from exploration_editor.geometry import lonlat_to_world, path_prefix, polygon_points_at_frame, route_progress, unwrap_longitudes
+from exploration_editor.geometry import lonlat_to_world, path_prefix, polygon_points_at_frame, rounded_closed_path, route_progress, unwrap_longitudes
 from exploration_editor.model import Project, RouteLayer, ViewState
 
 
@@ -93,7 +93,8 @@ def _build_reveal_mask(
         temp = Image.new("L", frame_size, 0)
         draw = ImageDraw.Draw(temp)
         for path in _screen_path_variants(points, layout):
-            draw.polygon(path, fill=int(255 * max(0.0, min(1.0, layer.opacity))))
+            render_path = rounded_closed_path(path, float(layer.rounding_px))
+            draw.polygon(render_path, fill=int(255 * max(0.0, min(1.0, layer.opacity))))
         blur_radius = max(0, int(layer.feather_px))
         if blur_radius > 0:
             temp = temp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
