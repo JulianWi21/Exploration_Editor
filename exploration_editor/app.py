@@ -37,6 +37,7 @@ from exploration_editor.geometry import (
     clamp,
     lonlat_to_world,
     polygon_edit_points_at_frame,
+    resample_path,
     rounded_closed_path,
     world_to_lonlat,
     unwrap_longitudes,
@@ -87,6 +88,7 @@ class MapCanvas(QWidget):
         self.temp_points: list[list[float]] = []
         self.hover_point: list[float] | None = None
         self._dragging_vertex_index: int | None = None
+        self._selected_vertex_index: int | None = None
         self.show_edit_overlays = True
         self.is_panning = False
         self.last_mouse_pos: tuple[float, float] | None = None
@@ -119,11 +121,13 @@ class MapCanvas(QWidget):
     def set_selected_polygon_layer(self, layer_id: str | None) -> None:
         self.selected_polygon_layer_id = layer_id
         self._dragging_vertex_index = None
+        self._selected_vertex_index = None
         self.update()
 
     def set_show_edit_overlays(self, show_edit_overlays: bool) -> None:
         self.show_edit_overlays = bool(show_edit_overlays)
         self._dragging_vertex_index = None
+        self._selected_vertex_index = None
         self.update()
 
     def invalidate_cache(self) -> None:
@@ -217,11 +221,109 @@ class MapCanvas(QWidget):
                     best_index = index
         return best_index
 
+    def _nearest_editable_edge(self, x: float, y: float) -> tuple[int, float] | None:
+        if self._last_layout is None:
+            return None
+        points = self._editable_polygon_points()
+        if len(points) < 3:
+            return None
+        tolerance_px = max(10.0, self.height() * 0.014)
+        best_match: tuple[int, float] | None = None
+        best_dist_sq = tolerance_px * tolerance_px
+        for path in self._screen_variants(points):
+            for index, (start_x, start_y) in enumerate(path):
+                end_x, end_y = path[(index + 1) % len(path)]
+                delta_x = end_x - start_x
+                delta_y = end_y - start_y
+                seg_len_sq = delta_x * delta_x + delta_y * delta_y
+                if seg_len_sq <= 1e-6:
+                    continue
+                t = clamp(((x - start_x) * delta_x + (y - start_y) * delta_y) / seg_len_sq, 0.0, 1.0)
+                proj_x = start_x + delta_x * t
+                proj_y = start_y + delta_y * t
+                dist_sq = (proj_x - x) * (proj_x - x) + (proj_y - y) * (proj_y - y)
+                if dist_sq <= best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_match = (index, float(t))
+        return best_match
+
+    def _interpolate_segment_point(self, start: list[float], end: list[float], t: float) -> list[float]:
+        pair = unwrap_longitudes([start, end])
+        lon = pair[0][0] * (1.0 - t) + pair[1][0] * t
+        lat = float(start[1] * (1.0 - t) + end[1] * t)
+        while lon < -180.0:
+            lon += 360.0
+        while lon > 180.0:
+            lon -= 360.0
+        return [float(lon), lat]
+
+    def _sync_polygon_keyframe_topology(self, layer: PolygonLayer, point_count: int) -> None:
+        target_count = max(3, int(point_count))
+        for keyframe in layer.keyframes:
+            if len(keyframe.points) != target_count:
+                keyframe.points = resample_path(keyframe.points, target_count, closed=True)
+
+    def insert_selected_polygon_vertex(self, x: float, y: float) -> bool:
+        if self.draw_kind or not self.show_edit_overlays:
+            return False
+        if self._nearest_editable_vertex(x, y) is not None:
+            return False
+        edge_match = self._nearest_editable_edge(x, y)
+        layer = self._selected_polygon_layer()
+        point = self._screen_to_lonlat(x, y)
+        if edge_match is None or layer is None or point is None:
+            return False
+
+        keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
+        if len(keyframe.points) < 3:
+            return False
+        self._sync_polygon_keyframe_topology(layer, len(keyframe.points))
+
+        edge_index, edge_t = edge_match
+        for polygon_keyframe in layer.keyframes:
+            points = polygon_keyframe.points
+            if len(points) < 3:
+                continue
+            next_index = (edge_index + 1) % len(points)
+            insert_index = len(points) if next_index == 0 else next_index
+            insert_point = point[:] if polygon_keyframe is keyframe else self._interpolate_segment_point(points[edge_index], points[next_index], edge_t)
+            polygon_keyframe.points.insert(insert_index, insert_point)
+
+        self._selected_vertex_index = len(keyframe.points) - 1 if (edge_index + 1) % len(keyframe.points) == 0 else edge_index + 1
+        self._dragging_vertex_index = None
+        self._render_now()
+        return True
+
+    def delete_selected_vertex(self) -> bool:
+        if self.draw_kind or not self.show_edit_overlays:
+            return False
+        layer = self._selected_polygon_layer()
+        if layer is None or self._selected_vertex_index is None:
+            return False
+        keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
+        if len(keyframe.points) <= 3 or not (0 <= self._selected_vertex_index < len(keyframe.points)):
+            return False
+
+        self._sync_polygon_keyframe_topology(layer, len(keyframe.points))
+        delete_index = self._selected_vertex_index
+        for polygon_keyframe in layer.keyframes:
+            if len(polygon_keyframe.points) > 3 and delete_index < len(polygon_keyframe.points):
+                polygon_keyframe.points.pop(delete_index)
+
+        if len(keyframe.points) > 3:
+            self._selected_vertex_index = min(delete_index, len(keyframe.points) - 1)
+        else:
+            self._selected_vertex_index = None
+        self._dragging_vertex_index = None
+        self._render_now()
+        return True
+
     def begin_polygon_draw(self, target_layer_id: str | None = None) -> None:
         self.draw_kind = "polygon"
         self.target_layer_id = target_layer_id
         self.temp_points = []
         self.hover_point = None
+        self._selected_vertex_index = None
         self.update()
 
     def begin_route_draw(self) -> None:
@@ -229,6 +331,7 @@ class MapCanvas(QWidget):
         self.target_layer_id = None
         self.temp_points = []
         self.hover_point = None
+        self._selected_vertex_index = None
         self.update()
 
     def cancel_drawing(self) -> None:
@@ -236,6 +339,7 @@ class MapCanvas(QWidget):
         self.target_layer_id = None
         self.temp_points = []
         self.hover_point = None
+        self._dragging_vertex_index = None
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -292,6 +396,7 @@ class MapCanvas(QWidget):
         outline = QColor(layer.color[0], layer.color[1], layer.color[2], 235)
         handle_outer = QColor(6, 8, 12, 220)
         handle_inner = QColor(245, 248, 252, 235)
+        selected_handle = QColor(88, 170, 255, 245)
         active_handle = QColor(255, 208, 84, 245)
 
         pen = QPen(outline)
@@ -307,7 +412,12 @@ class MapCanvas(QWidget):
             painter.drawPolygon(polygon)
             for index, (x, y) in enumerate(path):
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(active_handle if index == self._dragging_vertex_index else handle_outer)
+                if index == self._dragging_vertex_index:
+                    painter.setBrush(active_handle)
+                elif index == self._selected_vertex_index:
+                    painter.setBrush(selected_handle)
+                else:
+                    painter.setBrush(handle_outer)
                 painter.drawEllipse(QPointF(x, y), 5.5, 5.5)
                 painter.setBrush(handle_inner)
                 painter.drawEllipse(QPointF(x, y), 2.9, 2.9)
@@ -421,6 +531,7 @@ class MapCanvas(QWidget):
                 if layer is not None:
                     keyframe = self._ensure_polygon_keyframe(layer, self.frame_index)
                     if 0 <= handle_index < len(keyframe.points):
+                        self._selected_vertex_index = handle_index
                         self._dragging_vertex_index = handle_index
                         point = self._screen_to_lonlat(pos.x(), pos.y())
                         if point is not None:
@@ -428,6 +539,7 @@ class MapCanvas(QWidget):
                         self._schedule_interactive_render()
                         self.update()
                         return
+            self._selected_vertex_index = None
         if event.button() in {Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton}:
             self.is_panning = True
             self.last_mouse_pos = (pos.x(), pos.y())
@@ -473,6 +585,9 @@ class MapCanvas(QWidget):
         self.last_mouse_pos = None
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if not self.draw_kind and event.button() == Qt.MouseButton.LeftButton:
+            if self.insert_selected_polygon_vertex(event.position().x(), event.position().y()):
+                return
         if not self.draw_kind:
             return
         point = self._screen_to_lonlat(event.position().x(), event.position().y())
@@ -1015,6 +1130,10 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_H:
             self._set_final_preview_mode(not self.final_preview_button.isChecked())
             return
+        if event.key() == Qt.Key.Key_Delete:
+            if self.canvas.delete_selected_vertex():
+                self.statusBar().showMessage("Polygon point deleted", 2500)
+                return
         if event.key() == Qt.Key.Key_Escape:
             self.canvas.cancel_drawing()
             return
