@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QColorDialog,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -678,10 +679,12 @@ class MainWindow(QMainWindow):
         self.fog_spin = QDoubleSpinBox()
         self.fog_spin.setRange(0.0, 1.0)
         self.fog_spin.setSingleStep(0.02)
+        self.basemap_combo = QComboBox()
         project_form.addRow("Title", self.title_edit)
         project_form.addRow("Duration", self.duration_spin)
         project_form.addRow("FPS", self.fps_spin)
         project_form.addRow("Fog Opacity", self.fog_spin)
+        project_form.addRow("Basemap", self.basemap_combo)
         side_layout.addWidget(project_box)
 
         side_layout.addWidget(QLabel("Layers"))
@@ -769,6 +772,7 @@ class MainWindow(QMainWindow):
         self.duration_spin.valueChanged.connect(self._apply_project_form)
         self.fps_spin.valueChanged.connect(self._apply_project_form)
         self.fog_spin.valueChanged.connect(self._apply_project_form)
+        self.basemap_combo.currentIndexChanged.connect(self._apply_basemap_selection)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._advance_frame)
@@ -780,6 +784,58 @@ class MainWindow(QMainWindow):
         self.canvas.set_show_edit_overlays(not enabled)
         mode_text = "final preview" if enabled else "edit overlay"
         self.statusBar().showMessage(f"Viewer mode: {mode_text}", 2500)
+
+    def _available_basemap_paths(self) -> list[Path]:
+        basemap_dir = self.repo_root / "data" / "basemaps"
+        if not basemap_dir.exists():
+            return []
+        return sorted(
+            [
+                path.resolve()
+                for path in basemap_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            ],
+            key=lambda item: item.name.lower(),
+        )
+
+    def _refresh_basemap_selector(self) -> None:
+        current_path = Path(self.project.basemap_path).resolve() if self.project.basemap_path else None
+        available_paths = self._available_basemap_paths()
+
+        self.basemap_combo.blockSignals(True)
+        self.basemap_combo.clear()
+
+        current_index = -1
+        for index, path in enumerate(available_paths):
+            self.basemap_combo.addItem(path.name, str(path))
+            if current_path is not None and path == current_path:
+                current_index = index
+
+        if current_path is not None and current_index < 0:
+            prefix = "Missing" if not current_path.exists() else "Custom"
+            self.basemap_combo.addItem(f"{prefix}: {current_path.name}", str(current_path))
+            current_index = self.basemap_combo.count() - 1
+
+        if self.basemap_combo.count() > 0:
+            self.basemap_combo.setCurrentIndex(current_index if current_index >= 0 else 0)
+        self.basemap_combo.setEnabled(self.basemap_combo.count() > 0)
+        self.basemap_combo.blockSignals(False)
+
+    def _set_basemap_path(self, basemap_path: str | Path) -> None:
+        normalized = str(Path(basemap_path).resolve())
+        changed = normalized != self.project.basemap_path
+        self.project.basemap_path = normalized
+        self._refresh_basemap_selector()
+        if changed:
+            self.canvas.load_basemap(normalized)
+            self.statusBar().showMessage(f"Basemap loaded: {Path(normalized).name}", 2500)
+
+    def _apply_basemap_selection(self, _index: int) -> None:
+        if self._updating_form:
+            return
+        selected_path = self.basemap_combo.currentData()
+        if selected_path:
+            self._set_basemap_path(str(selected_path))
 
     def _apply_dark_palette(self) -> None:
         palette = QPalette()
@@ -835,10 +891,7 @@ class MainWindow(QMainWindow):
         path, _filter = QFileDialog.getOpenFileName(self, "Open Basemap", str(self.repo_root / "data" / "basemaps"), "Images (*.png *.jpg *.jpeg *.webp)")
         if not path:
             return
-        self.project.basemap_path = path
-        self.canvas.load_basemap(path)
-        self.canvas.invalidate_cache()
-        self.canvas.update()
+        self._set_basemap_path(path)
 
     def _refresh_layer_list(self) -> None:
         self.layer_list.blockSignals(True)
@@ -889,6 +942,7 @@ class MainWindow(QMainWindow):
         self.duration_spin.setValue(float(self.project.duration_sec))
         self.fps_spin.setValue(int(self.project.fps))
         self.fog_spin.setValue(float(self.project.fog_opacity))
+        self._refresh_basemap_selector()
         self._updating_form = False
 
     def _apply_project_form(self) -> None:
