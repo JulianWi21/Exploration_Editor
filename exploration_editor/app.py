@@ -87,6 +87,7 @@ class MapCanvas(QWidget):
         self.temp_points: list[list[float]] = []
         self.hover_point: list[float] | None = None
         self._dragging_vertex_index: int | None = None
+        self.show_edit_overlays = True
         self.is_panning = False
         self.last_mouse_pos: tuple[float, float] | None = None
         self._last_layout: dict[str, float] | None = None
@@ -117,6 +118,11 @@ class MapCanvas(QWidget):
 
     def set_selected_polygon_layer(self, layer_id: str | None) -> None:
         self.selected_polygon_layer_id = layer_id
+        self._dragging_vertex_index = None
+        self.update()
+
+    def set_show_edit_overlays(self, show_edit_overlays: bool) -> None:
+        self.show_edit_overlays = bool(show_edit_overlays)
         self._dragging_vertex_index = None
         self.update()
 
@@ -269,8 +275,9 @@ class MapCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self._cached_qimage is not None:
             painter.drawImage(self.rect(), self._cached_qimage)
-        self._draw_selected_polygon_overlay(painter)
-        self._draw_temp_overlay(painter)
+        if self.show_edit_overlays:
+            self._draw_selected_polygon_overlay(painter)
+            self._draw_temp_overlay(painter)
         painter.end()
 
     def _draw_selected_polygon_overlay(self, painter: QPainter) -> None:
@@ -389,6 +396,11 @@ class MapCanvas(QWidget):
 
     def mousePressEvent(self, event) -> None:
         pos = event.position()
+        if not self.show_edit_overlays:
+            if event.button() in {Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton}:
+                self.is_panning = True
+                self.last_mouse_pos = (pos.x(), pos.y())
+            return
         if self.draw_kind and event.button() == Qt.MouseButton.LeftButton:
             point = self._screen_to_lonlat(pos.x(), pos.y())
             if point is not None:
@@ -422,6 +434,15 @@ class MapCanvas(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position()
+        if not self.show_edit_overlays:
+            if self.is_panning and self.last_mouse_pos is not None:
+                dx = pos.x() - self.last_mouse_pos[0]
+                dy = pos.y() - self.last_mouse_pos[1]
+                self.project.view.offset_x += dx
+                self.project.view.offset_y += dy
+                self.last_mouse_pos = (pos.x(), pos.y())
+                self._schedule_interactive_render()
+            return
         if self.draw_kind:
             self.hover_point = self._screen_to_lonlat(pos.x(), pos.y())
             self.update()
@@ -500,6 +521,9 @@ class MainWindow(QMainWindow):
         self.export_png_button = QPushButton("Export PNG")
         self.export_video_button = QPushButton("Export MP4")
         self.play_button = QPushButton("Play")
+        self.final_preview_button = QPushButton("Final Preview")
+        self.final_preview_button.setCheckable(True)
+        self.final_preview_button.setToolTip("Hide edit handles and show only the rendered fog of war. Shortcut: H")
         for button in [
             self.new_project_button,
             self.open_project_button,
@@ -512,6 +536,7 @@ class MainWindow(QMainWindow):
             self.export_png_button,
             self.export_video_button,
             self.play_button,
+            self.final_preview_button,
         ]:
             toolbar.addWidget(button)
         toolbar.addStretch(1)
@@ -610,6 +635,7 @@ class MainWindow(QMainWindow):
         self.export_png_button.clicked.connect(self._export_png)
         self.export_video_button.clicked.connect(self._export_video)
         self.play_button.clicked.connect(self._toggle_play)
+        self.final_preview_button.toggled.connect(self._set_final_preview_mode)
         self.timeline_slider.valueChanged.connect(self._on_frame_changed)
         self.layer_list.currentRowChanged.connect(self._populate_layer_form)
         self.color_button.clicked.connect(self._pick_color)
@@ -631,6 +657,14 @@ class MainWindow(QMainWindow):
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._advance_frame)
+
+    def _set_final_preview_mode(self, enabled: bool) -> None:
+        self.final_preview_button.blockSignals(True)
+        self.final_preview_button.setChecked(bool(enabled))
+        self.final_preview_button.blockSignals(False)
+        self.canvas.set_show_edit_overlays(not enabled)
+        mode_text = "final preview" if enabled else "edit overlay"
+        self.statusBar().showMessage(f"Viewer mode: {mode_text}", 2500)
 
     def _apply_dark_palette(self) -> None:
         palette = QPalette()
@@ -977,6 +1011,9 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Space:
             self._toggle_play()
+            return
+        if event.key() == Qt.Key.Key_H:
+            self._set_final_preview_mode(not self.final_preview_button.isChecked())
             return
         if event.key() == Qt.Key.Key_Escape:
             self.canvas.cancel_drawing()
