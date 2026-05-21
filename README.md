@@ -85,3 +85,5 @@ Useful overrides:
 - This MVP uses a clean headless renderer plus a thin PyQt6 editor.
 - Route labels are currently handled as a legend, not text-on-path.
 - Polygon interpolation keeps matched vertices stable across keyframes and only inserts proxy points locally when topology changes.
+- Polygon keyframes can now retime their outgoing segment with Linear, Ease In, Ease Out, or Ease In-Out timing curves from the editor.
+- Polygon keyframes can optionally equalize revealed area over time with the Constant Area checkbox on the outgoing segment.

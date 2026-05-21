@@ -44,7 +44,17 @@ from exploration_editor.geometry import (
     world_to_lonlat,
     unwrap_longitudes,
 )
-from exploration_editor.model import DEFAULT_BASEMAP_PATH, PolygonKeyframe, PolygonLayer, Project, RouteLayer, default_project, load_project, save_project
+from exploration_editor.model import (
+    DEFAULT_BASEMAP_PATH,
+    POLYGON_EASING_LINEAR,
+    PolygonKeyframe,
+    PolygonLayer,
+    Project,
+    RouteLayer,
+    default_project,
+    load_project,
+    save_project,
+)
 from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
 from exploration_editor.render import clamp_view_state, compute_map_layout, render_frame
 
@@ -66,6 +76,12 @@ VIDEO_FORMAT_PRESETS = [
     ("Full HD 1080p (1920x1080)", (1920, 1080)),
     ("QHD 1440p (2560x1440)", (2560, 1440)),
     ("4K UHD 2160p (3840x2160)", (3840, 2160)),
+]
+POLYGON_EASING_OPTIONS = [
+    ("Linear", POLYGON_EASING_LINEAR),
+    ("Ease In", "ease_in"),
+    ("Ease Out", "ease_out"),
+    ("Ease In-Out", "ease_in_out"),
 ]
 
 
@@ -1002,6 +1018,14 @@ class MainWindow(QMainWindow):
         self.opacity_spin = QDoubleSpinBox()
         self.opacity_spin.setRange(0.05, 1.0)
         self.opacity_spin.setSingleStep(0.05)
+        self.polygon_constant_area_check = QCheckBox()
+        self.polygon_constant_area_check.setToolTip(
+            "Equalize discovered polygon area across time for the segment from the current exact keyframe to the next one."
+        )
+        self.polygon_easing_combo = QComboBox()
+        for label, value in POLYGON_EASING_OPTIONS:
+            self.polygon_easing_combo.addItem(label, value)
+        self.polygon_easing_combo.setToolTip("Controls the timing curve from the exact polygon keyframe at the current frame to the next polygon keyframe.")
         self.route_width_spin = QSpinBox()
         self.route_width_spin.setRange(1, 60)
         self.route_reveal_spin = QSpinBox()
@@ -1016,6 +1040,8 @@ class MainWindow(QMainWindow):
         props_form.addRow("Feather", self.feather_spin)
         props_form.addRow("Rounding", self.rounding_spin)
         props_form.addRow("Opacity", self.opacity_spin)
+        props_form.addRow("Constant Area", self.polygon_constant_area_check)
+        props_form.addRow("Next Segment", self.polygon_easing_combo)
         props_form.addRow("Route Width", self.route_width_spin)
         props_form.addRow("Reveal Width", self.route_reveal_spin)
         props_form.addRow("Start Frame", self.route_start_spin)
@@ -1076,6 +1102,8 @@ class MainWindow(QMainWindow):
         self.feather_spin.valueChanged.connect(self._apply_layer_form)
         self.rounding_spin.valueChanged.connect(self._apply_layer_form)
         self.opacity_spin.valueChanged.connect(self._apply_layer_form)
+        self.polygon_constant_area_check.stateChanged.connect(self._apply_polygon_constant_area)
+        self.polygon_easing_combo.currentIndexChanged.connect(self._apply_polygon_easing)
         self.route_width_spin.valueChanged.connect(self._apply_layer_form)
         self.route_reveal_spin.valueChanged.connect(self._apply_layer_form)
         self.route_start_spin.valueChanged.connect(self._apply_layer_form)
@@ -1329,6 +1357,8 @@ class MainWindow(QMainWindow):
             self.feather_spin,
             self.rounding_spin,
             self.opacity_spin,
+            self.polygon_constant_area_check,
+            self.polygon_easing_combo,
             self.route_width_spin,
             self.route_reveal_spin,
             self.route_start_spin,
@@ -1340,6 +1370,7 @@ class MainWindow(QMainWindow):
         if layer is None:
             self.layer_name_edit.setText("")
             self._set_color_button([255, 255, 255])
+            self._populate_polygon_easing_form(None, None, False)
             self._updating_form = False
             return
         self.layer_name_edit.setText(layer.name)
@@ -1349,6 +1380,8 @@ class MainWindow(QMainWindow):
         self.feather_spin.setEnabled(is_polygon)
         self.rounding_spin.setEnabled(is_polygon)
         self.opacity_spin.setEnabled(is_polygon)
+        self.polygon_constant_area_check.setEnabled(is_polygon)
+        self.polygon_easing_combo.setEnabled(is_polygon)
         self.route_width_spin.setEnabled(not is_polygon)
         self.route_reveal_spin.setEnabled(not is_polygon)
         self.route_start_spin.setEnabled(not is_polygon)
@@ -1361,6 +1394,8 @@ class MainWindow(QMainWindow):
             self.feather_spin.setValue(layer.feather_px)
             self.rounding_spin.setValue(layer.rounding_px)
             self.opacity_spin.setValue(layer.opacity)
+            exact_keyframe, has_outgoing_segment = self._selected_polygon_keyframe_at_current_frame(layer)
+            self._populate_polygon_easing_form(layer, exact_keyframe, has_outgoing_segment)
         else:
             self.route_width_spin.setValue(layer.width_px)
             self.route_reveal_spin.setValue(layer.reveal_px)
@@ -1368,7 +1403,96 @@ class MainWindow(QMainWindow):
             self.route_end_spin.setValue(layer.end_frame)
             self.route_label_edit.setText(layer.label)
             self.route_legend_check.setChecked(layer.show_in_legend)
+            self._populate_polygon_easing_form(None, None, False)
         self._updating_form = False
+
+    def _selected_polygon_keyframe_at_current_frame(self, layer: PolygonLayer) -> tuple[PolygonKeyframe | None, bool]:
+        keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+        current_frame = int(self.timeline_slider.value())
+        for index, keyframe in enumerate(keyframes):
+            if int(keyframe.frame) == current_frame:
+                return keyframe, index < len(keyframes) - 1
+        return None, False
+
+    def _populate_polygon_easing_form(
+        self,
+        layer: PolygonLayer | None,
+        keyframe: PolygonKeyframe | None,
+        has_outgoing_segment: bool,
+    ) -> None:
+        self.polygon_constant_area_check.blockSignals(True)
+        self.polygon_easing_combo.blockSignals(True)
+        easing_value = getattr(keyframe, "outgoing_easing", POLYGON_EASING_LINEAR) if keyframe is not None else POLYGON_EASING_LINEAR
+        constant_area_enabled = bool(getattr(keyframe, "outgoing_constant_area", False)) if keyframe is not None else False
+        combo_index = self.polygon_easing_combo.findData(easing_value)
+        if combo_index < 0:
+            combo_index = self.polygon_easing_combo.findData(POLYGON_EASING_LINEAR)
+        self.polygon_easing_combo.setCurrentIndex(max(0, combo_index))
+        self.polygon_constant_area_check.setChecked(constant_area_enabled)
+
+        if layer is None:
+            self.polygon_constant_area_check.setEnabled(False)
+            self.polygon_constant_area_check.setToolTip("Select a polygon layer to edit segment timing.")
+            self.polygon_easing_combo.setEnabled(False)
+            self.polygon_easing_combo.setToolTip("Select a polygon layer to edit keyframe easing.")
+        elif keyframe is None:
+            self.polygon_constant_area_check.setEnabled(False)
+            self.polygon_constant_area_check.setToolTip("Move the timeline to an exact polygon keyframe to edit the outgoing segment timing.")
+            self.polygon_easing_combo.setEnabled(False)
+            self.polygon_easing_combo.setToolTip("Move the timeline to an exact polygon keyframe to edit the outgoing segment easing.")
+        elif not has_outgoing_segment:
+            self.polygon_constant_area_check.setEnabled(False)
+            self.polygon_constant_area_check.setToolTip("The last polygon keyframe has no outgoing segment.")
+            self.polygon_easing_combo.setEnabled(False)
+            self.polygon_easing_combo.setToolTip("The last polygon keyframe has no outgoing segment.")
+        else:
+            self.polygon_constant_area_check.setEnabled(True)
+            self.polygon_constant_area_check.setToolTip(
+                "Equalize discovered area over time for the segment from this polygon keyframe to the next one."
+            )
+            self.polygon_easing_combo.setEnabled(not constant_area_enabled)
+            self.polygon_easing_combo.setToolTip(
+                "Disabled while Constant Area is active for this segment."
+                if constant_area_enabled
+                else "Controls the timing curve from this polygon keyframe to the next one."
+            )
+        self.polygon_constant_area_check.blockSignals(False)
+        self.polygon_easing_combo.blockSignals(False)
+
+    def _apply_polygon_constant_area(self, _state: int) -> None:
+        if self._updating_form:
+            return
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            return
+
+        keyframe, has_outgoing_segment = self._selected_polygon_keyframe_at_current_frame(layer)
+        if keyframe is None or not has_outgoing_segment:
+            return
+
+        keyframe.outgoing_constant_area = self.polygon_constant_area_check.isChecked()
+        self._populate_polygon_easing_form(layer, keyframe, has_outgoing_segment)
+        mode_label = "enabled" if keyframe.outgoing_constant_area else "disabled"
+        self.statusBar().showMessage(f"Constant area pacing {mode_label} for polygon segment", 2500)
+        self._refresh_canvas_only()
+
+    def _apply_polygon_easing(self, _index: int) -> None:
+        if self._updating_form:
+            return
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            return
+
+        keyframe, has_outgoing_segment = self._selected_polygon_keyframe_at_current_frame(layer)
+        if keyframe is None or not has_outgoing_segment:
+            return
+        if getattr(keyframe, "outgoing_constant_area", False):
+            return
+
+        keyframe.outgoing_easing = str(self.polygon_easing_combo.currentData() or POLYGON_EASING_LINEAR)
+        easing_label = self.polygon_easing_combo.currentText()
+        self.statusBar().showMessage(f"Polygon segment easing set: {easing_label}", 2500)
+        self._refresh_canvas_only()
 
     def _apply_layer_form(self) -> None:
         if self._updating_form:

@@ -1,15 +1,122 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 from typing import Iterable
 
 import numpy as np
 
-from exploration_editor.model import PolygonLayer
+from exploration_editor.model import POLYGON_EASING_LINEAR, POLYGON_EASING_MODES, PolygonLayer
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def apply_easing(value: float, easing: str | None) -> float:
+    t = clamp(float(value), 0.0, 1.0)
+    mode = str(easing or POLYGON_EASING_LINEAR).strip().lower()
+    if mode not in POLYGON_EASING_MODES or mode == POLYGON_EASING_LINEAR:
+        return t
+    if mode == "ease_in":
+        return t * t
+    if mode == "ease_out":
+        one_minus_t = 1.0 - t
+        return 1.0 - one_minus_t * one_minus_t
+    if mode == "ease_in_out":
+        return t * t * (3.0 - 2.0 * t)
+    return t
+
+
+def _immutable_points(points: Iterable[Iterable[float]]) -> tuple[tuple[float, float], ...]:
+    return tuple((float(point[0]), float(point[1])) for point in points)
+
+
+def _polygon_area(points: Iterable[Iterable[float]]) -> float:
+    path = unwrap_longitudes(points)
+    if len(path) < 3:
+        return 0.0
+    area = 0.0
+    for index, (x1, y1) in enumerate(path):
+        x2, y2 = path[(index + 1) % len(path)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+@lru_cache(maxsize=256)
+def _build_constant_area_curve(
+    points_a_key: tuple[tuple[float, float], ...],
+    points_b_key: tuple[tuple[float, float], ...],
+    sample_count: int,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    points_a = [list(point) for point in points_a_key]
+    points_b = [list(point) for point in points_b_key]
+    sample_total = max(9, int(sample_count))
+    samples_t = np.linspace(0.0, 1.0, sample_total, dtype=np.float64)
+    areas = np.empty(sample_total, dtype=np.float64)
+
+    for index, sample_t in enumerate(samples_t):
+        if index == 0:
+            interpolated = points_a
+        elif index == sample_total - 1:
+            interpolated = points_b
+        else:
+            interpolated = interpolate_paths(points_a, points_b, float(sample_t), closed=True)
+        areas[index] = _polygon_area(interpolated)
+
+    delta = float(areas[-1] - areas[0])
+    if abs(delta) <= 1e-6:
+        identity = tuple(float(value) for value in samples_t)
+        return identity, identity
+
+    monotonic_areas = np.maximum.accumulate(areas) if delta > 0.0 else np.minimum.accumulate(areas)
+    progress = np.clip((monotonic_areas - monotonic_areas[0]) / delta, 0.0, 1.0)
+    progress[0] = 0.0
+    progress[-1] = 1.0
+
+    keep_indices = [0]
+    last_progress = float(progress[0])
+    for index in range(1, len(progress) - 1):
+        current_progress = float(progress[index])
+        if current_progress > last_progress + 1e-6:
+            keep_indices.append(index)
+            last_progress = current_progress
+    keep_indices.append(len(progress) - 1)
+
+    kept_progress = tuple(float(progress[index]) for index in keep_indices)
+    kept_t = tuple(float(samples_t[index]) for index in keep_indices)
+    if len(kept_progress) < 2 or kept_progress[-1] <= kept_progress[0] + 1e-6:
+        identity = tuple(float(value) for value in samples_t)
+        return identity, identity
+    return kept_progress, kept_t
+
+
+def remap_constant_area_progress(
+    points_a: list[list[float]],
+    points_b: list[list[float]],
+    value: float,
+    sample_count: int = 65,
+) -> float:
+    t = clamp(float(value), 0.0, 1.0)
+    progress_curve, t_curve = _build_constant_area_curve(
+        _immutable_points(points_a),
+        _immutable_points(points_b),
+        int(sample_count),
+    )
+    return float(np.interp(t, np.asarray(progress_curve, dtype=np.float64), np.asarray(t_curve, dtype=np.float64)))
+
+
+def polygon_segment_progress(
+    left_points: list[list[float]],
+    right_points: list[list[float]],
+    value: float,
+    easing: str | None = None,
+    constant_area: bool = False,
+) -> float:
+    t = clamp(float(value), 0.0, 1.0)
+    if bool(constant_area):
+        return remap_constant_area_progress(left_points, right_points, t)
+    return apply_easing(t, easing)
 
 
 def lonlat_to_world(lon: float, lat: float, world_size: tuple[float, float], wrap: bool = True) -> tuple[float, float]:
@@ -275,7 +382,13 @@ def polygon_edit_points_at_frame(layer: PolygonLayer, frame: int) -> list[list[f
             if frame == right.frame:
                 return [point[:] for point in right.points]
             span = max(1, right.frame - left.frame)
-            t = (frame - left.frame) / span
+            t = polygon_segment_progress(
+                left.points,
+                right.points,
+                (frame - left.frame) / span,
+                easing=getattr(left, "outgoing_easing", POLYGON_EASING_LINEAR),
+                constant_area=getattr(left, "outgoing_constant_area", False),
+            )
             sample_count = max(len(left.points), len(right.points), 3)
             return interpolate_paths(
                 left.points,
@@ -360,7 +473,13 @@ def polygon_points_at_frame(layer: PolygonLayer, frame: int) -> list[list[float]
             if frame == right.frame:
                 return [point[:] for point in right.points]
             span = max(1, right.frame - left.frame)
-            t = (frame - left.frame) / span
+            t = polygon_segment_progress(
+                left.points,
+                right.points,
+                (frame - left.frame) / span,
+                easing=getattr(left, "outgoing_easing", POLYGON_EASING_LINEAR),
+                constant_area=getattr(left, "outgoing_constant_area", False),
+            )
             return interpolate_paths(left.points, right.points, t, closed=True)
     return [point[:] for point in keyframes[-1].points]
 

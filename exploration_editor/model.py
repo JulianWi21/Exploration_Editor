@@ -9,6 +9,13 @@ import uuid
 
 
 DEFAULT_BASEMAP_PATH = "data/basemaps/world_natural_earth_ii_8192.jpg"
+POLYGON_EASING_LINEAR = "linear"
+POLYGON_EASING_MODES = (
+    POLYGON_EASING_LINEAR,
+    "ease_in",
+    "ease_out",
+    "ease_in_out",
+)
 
 
 def _uid(prefix: str) -> str:
@@ -26,6 +33,8 @@ class ViewState:
 class PolygonKeyframe:
     frame: int
     points: list[list[float]] = field(default_factory=list)
+    outgoing_easing: str = POLYGON_EASING_LINEAR
+    outgoing_constant_area: bool = False
 
 
 @dataclass
@@ -96,11 +105,24 @@ def _coerce_points(raw_points: list[Any]) -> list[list[float]]:
     return points
 
 
+def _coerce_polygon_easing(value: Any) -> str:
+    candidate = str(value or POLYGON_EASING_LINEAR).strip().lower()
+    return candidate if candidate in POLYGON_EASING_MODES else POLYGON_EASING_LINEAR
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _polygon_from_dict(data: dict[str, Any]) -> PolygonLayer:
     keyframes = [
         PolygonKeyframe(
             frame=int(item.get("frame", 0)),
             points=_coerce_points(item.get("points", [])),
+            outgoing_easing=_coerce_polygon_easing(item.get("outgoing_easing", item.get("easing", POLYGON_EASING_LINEAR))),
+            outgoing_constant_area=_coerce_bool(item.get("outgoing_constant_area", item.get("constant_area", False))),
         )
         for item in data.get("keyframes", [])
     ]
