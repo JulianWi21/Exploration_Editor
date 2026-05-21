@@ -11,7 +11,7 @@ from PIL import Image
 from static_ffmpeg import run
 
 from exploration_editor.basemap import repo_root
-from exploration_editor.render import render_frame
+from exploration_editor.render import prepare_frame_render, render_frame
 from exploration_editor.model import Project
 
 
@@ -143,6 +143,12 @@ def export_video(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     silent_output = output.with_name(f"{output.stem}.silent{output.suffix}")
+    prepared_render = prepare_frame_render(
+        project,
+        basemap_image=basemap_image,
+        output_size=(project.width, project.height),
+        preview=False,
+    )
     command = [
         ffmpeg_path,
         "-y",
@@ -181,6 +187,9 @@ def export_video(
     fade_out_start = render_end + hold_end_frames
     total = export_frame_count(project)
     last_frame_index = max(0, int(project.frame_count) - 1)
+    cacheable_frame_indices = {0, last_frame_index}
+    cached_frames: dict[int, Image.Image] = {}
+    cached_frame_bytes: dict[int, bytes] = {}
 
     try:
         for frame_index in range(total):
@@ -191,19 +200,35 @@ def export_video(
             else:
                 source_frame_index = last_frame_index
 
-            image = render_frame(
-                project,
-                basemap_image=basemap_image,
-                frame_index=source_frame_index,
-                output_size=(project.width, project.height),
-                font_path=font_path,
-                preview=False,
-            )
+            image = cached_frames.get(source_frame_index)
+            if image is None:
+                image = render_frame(
+                    project,
+                    basemap_image=basemap_image,
+                    frame_index=source_frame_index,
+                    output_size=(project.width, project.height),
+                    font_path=font_path,
+                    preview=False,
+                    prepared_render=prepared_render,
+                )
+                if source_frame_index in cacheable_frame_indices:
+                    cached_frames[source_frame_index] = image
+
             if fade_in_frames > 0 and frame_index < fade_in_frames:
-                image = _apply_black_fade(image, frame_index / fade_in_frames)
+                frame_bytes = _apply_black_fade(image, frame_index / fade_in_frames).tobytes()
             elif fade_out_frames > 0 and frame_index >= fade_out_start:
-                image = _apply_black_fade(image, max(0.0, 1.0 - ((frame_index - fade_out_start) / fade_out_frames)))
-            proc.stdin.write(image.tobytes())
+                frame_bytes = _apply_black_fade(
+                    image,
+                    max(0.0, 1.0 - ((frame_index - fade_out_start) / fade_out_frames)),
+                ).tobytes()
+            else:
+                frame_bytes = cached_frame_bytes.get(source_frame_index, b"")
+                if not frame_bytes:
+                    frame_bytes = image.tobytes()
+                    if source_frame_index in cacheable_frame_indices:
+                        cached_frame_bytes[source_frame_index] = frame_bytes
+
+            proc.stdin.write(frame_bytes)
             if progress_callback is not None:
                 progress_callback(frame_index + 1, total)
     finally:

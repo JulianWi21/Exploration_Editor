@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +10,14 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 from exploration_editor.basemap import load_basemap_image
 from exploration_editor.geometry import lonlat_to_world, path_prefix, polygon_points_at_frame, rounded_closed_path, route_progress, unwrap_longitudes
 from exploration_editor.model import Project, RouteLayer, ViewState
+
+
+@dataclass(frozen=True)
+class PreparedFrameRender:
+    output_size: tuple[int, int]
+    layout: dict[str, float]
+    background_array: np.ndarray
+    map_alpha: np.ndarray
 
 
 def clamp_view_state(
@@ -153,12 +163,55 @@ def _build_reveal_mask(
     return reveal
 
 
-def _load_font(font_path: str | Path | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    if font_path:
-        candidate = Path(font_path)
+@lru_cache(maxsize=32)
+def _load_font_cached(font_key: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if font_key:
+        candidate = Path(font_key)
         if candidate.exists():
             return ImageFont.truetype(candidate.as_posix(), size=size)
     return ImageFont.load_default()
+
+
+def _load_font(font_path: str | Path | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_key = str(Path(font_path).resolve()) if font_path else ""
+    return _load_font_cached(font_key, int(size))
+
+
+def prepare_frame_render(
+    project: Project,
+    basemap_image: Image.Image | None = None,
+    display_basemap_image: Image.Image | None = None,
+    output_size: tuple[int, int] | None = None,
+    preview: bool = True,
+) -> PreparedFrameRender:
+    if output_size is None:
+        output_size = (project.width, project.height)
+    frame_w, frame_h = output_size
+    if basemap_image is None:
+        basemap_image = load_basemap_image(project.basemap_path)
+    if basemap_image.mode != "RGB":
+        basemap_image = basemap_image.convert("RGB")
+    if display_basemap_image is None:
+        display_basemap_image = basemap_image
+    elif display_basemap_image.mode != "RGB":
+        display_basemap_image = display_basemap_image.convert("RGB")
+
+    layout = compute_map_layout((frame_w, frame_h), basemap_image.size, project.view)
+    background = Image.new("RGB", (frame_w, frame_h), tuple(project.fog_color[:3]))
+
+    draw_w = max(1, int(round(layout["draw_w"])))
+    draw_h = max(1, int(round(layout["draw_h"])))
+    resample = Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS
+    scaled_map = display_basemap_image.resize((draw_w, draw_h), resample=resample)
+    background.paste(scaled_map, (int(round(layout["offset_x"])), int(round(layout["offset_y"]))))
+
+    map_mask = _build_map_mask((frame_w, frame_h), layout)
+    return PreparedFrameRender(
+        output_size=(frame_w, frame_h),
+        layout=layout,
+        background_array=np.asarray(background, dtype=np.float32),
+        map_alpha=np.asarray(map_mask, dtype=np.float32) / 255.0,
+    )
 
 
 def _draw_routes(
@@ -262,35 +315,24 @@ def render_frame(
     output_size: tuple[int, int] | None = None,
     font_path: str | Path | None = None,
     preview: bool = True,
+    prepared_render: PreparedFrameRender | None = None,
 ) -> Image.Image:
-    if output_size is None:
-        output_size = (project.width, project.height)
-    frame_w, frame_h = output_size
-    if basemap_image is None:
-        basemap_image = load_basemap_image(project.basemap_path)
-    if basemap_image.mode != "RGB":
-        basemap_image = basemap_image.convert("RGB")
-    if display_basemap_image is None:
-        display_basemap_image = basemap_image
-    elif display_basemap_image.mode != "RGB":
-        display_basemap_image = display_basemap_image.convert("RGB")
+    if prepared_render is None:
+        prepared_render = prepare_frame_render(
+            project,
+            basemap_image=basemap_image,
+            display_basemap_image=display_basemap_image,
+            output_size=output_size,
+            preview=preview,
+        )
 
-    layout = compute_map_layout((frame_w, frame_h), basemap_image.size, project.view)
-    background = Image.new("RGB", (frame_w, frame_h), tuple(project.fog_color[:3]))
-
-    draw_w = max(1, int(round(layout["draw_w"])))
-    draw_h = max(1, int(round(layout["draw_h"])))
-    resample = Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS
-    scaled_map = display_basemap_image.resize((draw_w, draw_h), resample=resample)
-    background.paste(scaled_map, (int(round(layout["offset_x"])), int(round(layout["offset_y"]))))
-
-    map_mask = _build_map_mask((frame_w, frame_h), layout)
+    frame_w, frame_h = prepared_render.output_size
+    layout = prepared_render.layout
     reveal_mask = _build_reveal_mask(project, frame_index, (frame_w, frame_h), layout)
 
-    frame_arr = np.asarray(background, dtype=np.float32)
-    map_alpha = np.asarray(map_mask, dtype=np.float32) / 255.0
+    frame_arr = prepared_render.background_array.copy()
     reveal_alpha = np.asarray(reveal_mask, dtype=np.float32) / 255.0
-    fog_mix = float(project.fog_opacity) * map_alpha * (1.0 - reveal_alpha)
+    fog_mix = float(project.fog_opacity) * prepared_render.map_alpha * (1.0 - reveal_alpha)
     fog_color = np.asarray(project.fog_color[:3], dtype=np.float32)
     frame_arr = frame_arr * (1.0 - fog_mix[..., None]) + fog_color * fog_mix[..., None]
     frame_img = Image.fromarray(np.clip(frame_arr, 0, 255).astype(np.uint8), mode="RGB")

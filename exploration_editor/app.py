@@ -724,6 +724,7 @@ class MainWindow(QMainWindow):
         self.new_project_button = QPushButton("New")
         self.open_project_button = QPushButton("Open")
         self.save_project_button = QPushButton("Save")
+        self.save_project_as_button = QPushButton("Save As")
         self.open_basemap_button = QPushButton("Open Basemap")
         self.new_polygon_button = QPushButton("New Polygon")
         self.add_keyframe_button = QPushButton("Add Polygon Keyframe")
@@ -739,6 +740,7 @@ class MainWindow(QMainWindow):
             self.new_project_button,
             self.open_project_button,
             self.save_project_button,
+            self.save_project_as_button,
             self.open_basemap_button,
             self.new_polygon_button,
             self.add_keyframe_button,
@@ -842,6 +844,7 @@ class MainWindow(QMainWindow):
         self.new_project_button.clicked.connect(self._new_project)
         self.open_project_button.clicked.connect(self._open_project)
         self.save_project_button.clicked.connect(self._save_project)
+        self.save_project_as_button.clicked.connect(self._save_project_as)
         self.open_basemap_button.clicked.connect(self._open_basemap)
         self.new_polygon_button.clicked.connect(lambda: self.canvas.begin_polygon_draw(None))
         self.add_keyframe_button.clicked.connect(self._begin_polygon_keyframe)
@@ -1018,6 +1021,16 @@ class MainWindow(QMainWindow):
             self.project_path = path
         save_project(self.project, self.project_path)
         self.statusBar().showMessage(f"Project saved: {self.project_path}", 4000)
+
+    def _save_project_as(self) -> None:
+        default_name = self.project.title.lower().replace(" ", "_") or "exploration_project"
+        default_path = Path(self.project_path) if self.project_path else self.examples_root / f"{default_name}.json"
+        path, _filter = QFileDialog.getSaveFileName(self, "Save Project As", str(default_path), "JSON Files (*.json)")
+        if not path:
+            return
+        self.project_path = path
+        save_project(self.project, self.project_path)
+        self.statusBar().showMessage(f"Project saved as: {self.project_path}", 4000)
 
     def _open_basemap(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(self, "Open Basemap", str(self.repo_root / "data" / "basemaps"), "Images (*.png *.jpg *.jpeg *.webp)")
