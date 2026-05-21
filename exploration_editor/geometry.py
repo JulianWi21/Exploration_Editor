@@ -113,6 +113,112 @@ def _interpolate_matched_points(points_a: list[list[float]], points_b: list[list
     return blended
 
 
+def _point_distance_sq(point_a: list[float], point_b: list[float]) -> float:
+    delta_lon = float(point_b[0]) - float(point_a[0])
+    while delta_lon > 180.0:
+        delta_lon -= 360.0
+    while delta_lon < -180.0:
+        delta_lon += 360.0
+    delta_lat = float(point_b[1]) - float(point_a[1])
+    return delta_lon * delta_lon + delta_lat * delta_lat
+
+
+def _interpolate_edge_point(start: list[float], end: list[float], t: float) -> list[float]:
+    pair = unwrap_longitudes([start, end])
+    lon = pair[0][0] * (1.0 - t) + pair[1][0] * t
+    lat = float(start[1] * (1.0 - t) + end[1] * t)
+    return [_wrap_longitude(lon), lat]
+
+
+def _select_subsequence_indices(points_small: list[list[float]], points_large: list[list[float]]) -> list[int]:
+    small_count = len(points_small)
+    large_count = len(points_large)
+    if small_count == 0:
+        return []
+    if small_count >= large_count:
+        return list(range(large_count))
+
+    parents = [[-1] * large_count for _ in range(small_count)]
+    previous = [math.inf] * large_count
+    max_first_index = large_count - small_count
+    for large_index in range(max_first_index + 1):
+        previous[large_index] = _point_distance_sq(points_small[0], points_large[large_index])
+
+    for small_index in range(1, small_count):
+        current = [math.inf] * large_count
+        prefix_best = math.inf
+        prefix_index = -1
+        min_large_index = small_index
+        max_large_index = large_count - (small_count - small_index)
+        for large_index in range(min_large_index, max_large_index + 1):
+            candidate_index = large_index - 1
+            candidate_cost = previous[candidate_index]
+            if candidate_cost < prefix_best:
+                prefix_best = candidate_cost
+                prefix_index = candidate_index
+            if prefix_index >= 0 and prefix_best < math.inf:
+                current[large_index] = prefix_best + _point_distance_sq(points_small[small_index], points_large[large_index])
+                parents[small_index][large_index] = prefix_index
+        previous = current
+
+    valid_last_indices = range(small_count - 1, large_count)
+    best_last_index = min(valid_last_indices, key=lambda index: previous[index])
+    if math.isinf(previous[best_last_index]):
+        return list(range(small_count))
+
+    selected = [0] * small_count
+    selected[-1] = best_last_index
+    for small_index in range(small_count - 1, 0, -1):
+        selected[small_index - 1] = parents[small_index][selected[small_index]]
+    return selected
+
+
+def _cyclic_index_span(start_index: int, end_index: int, count: int) -> list[int]:
+    indices = [start_index]
+    current = start_index
+    while current != end_index:
+        current = (current + 1) % count
+        indices.append(current)
+    return indices
+
+
+def _expand_closed_path_to_match(points_small: list[list[float]], points_large: list[list[float]]) -> list[list[float]]:
+    if not points_small:
+        return []
+    if len(points_small) >= len(points_large):
+        return [point[:] for point in points_small]
+
+    selected = _select_subsequence_indices(points_small, points_large)
+    expanded: list[list[float] | None] = [None] * len(points_large)
+    for small_index, large_index in enumerate(selected):
+        expanded[large_index] = points_small[small_index][:]
+
+    for small_index, start_large_index in enumerate(selected):
+        next_small_index = (small_index + 1) % len(points_small)
+        end_large_index = selected[next_small_index]
+        span_indices = _cyclic_index_span(start_large_index, end_large_index, len(points_large))
+        if len(span_indices) <= 2:
+            continue
+
+        span_points = [points_large[index] for index in span_indices]
+        span_path = np.asarray(unwrap_longitudes(span_points), dtype=np.float64)
+        span_lengths = _path_lengths(span_path)
+        span_total = float(span_lengths[-1])
+        denominator = max(1, len(span_indices) - 1)
+        for offset, large_index in enumerate(span_indices[1:-1], start=1):
+            if span_total <= 1e-6:
+                position = offset / denominator
+            else:
+                position = float(span_lengths[offset] / span_total)
+            expanded[large_index] = _interpolate_edge_point(
+                points_small[small_index],
+                points_small[next_small_index],
+                position,
+            )
+
+    return [point[:] if point is not None else points_large[index][:] for index, point in enumerate(expanded)]
+
+
 def interpolate_paths(
     points_a: list[list[float]],
     points_b: list[list[float]],
@@ -130,6 +236,16 @@ def interpolate_paths(
         requested_samples = len(points_a) if sample_count is None else int(sample_count)
         if requested_samples == len(points_a):
             return _interpolate_matched_points(points_a, points_b, t)
+    if closed and len(points_a) != len(points_b):
+        if len(points_a) < len(points_b):
+            aligned_a = _expand_closed_path_to_match(points_a, points_b)
+            blended = _interpolate_matched_points(aligned_a, points_b, t)
+        else:
+            aligned_b = _expand_closed_path_to_match(points_b, points_a)
+            blended = _interpolate_matched_points(points_a, aligned_b, t)
+        if sample_count is not None and int(sample_count) > len(blended):
+            return resample_path(blended, int(sample_count), closed=True)
+        return blended
     if sample_count is None:
         sample_count = max(len(points_a), len(points_b), 96 if closed else 48)
     else:

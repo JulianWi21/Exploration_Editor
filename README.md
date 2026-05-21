@@ -84,4 +84,4 @@ Useful overrides:
 
 - This MVP uses a clean headless renderer plus a thin PyQt6 editor.
 - Route labels are currently handled as a legend, not text-on-path.
-- Polygon interpolation uses perimeter resampling, which is robust enough for authoring but still simple to understand and extend.
+- Polygon interpolation keeps matched vertices stable across keyframes and only inserts proxy points locally when topology changes.
