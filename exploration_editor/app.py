@@ -7,7 +7,7 @@ import sys
 import time
 
 from PIL import Image
-from PyQt6.QtCore import QPointF, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication,
@@ -76,9 +76,205 @@ def _pil_to_qimage(image) -> QImage:
     return qimage.copy()
 
 
+def clamp_keyframe_frame(keyframes: list[int], index: int, target_frame: int, minimum: int, maximum: int) -> int:
+    minimum_frame = int(minimum)
+    maximum_frame = max(minimum_frame, int(maximum))
+    lower_bound = minimum_frame
+    upper_bound = maximum_frame
+
+    if 0 <= index < len(keyframes):
+        if index > 0:
+            lower_bound = max(lower_bound, int(keyframes[index - 1]) + 1)
+        if index + 1 < len(keyframes):
+            upper_bound = min(upper_bound, int(keyframes[index + 1]) - 1)
+
+    if lower_bound > upper_bound:
+        lower_bound = upper_bound = max(minimum_frame, min(maximum_frame, int(target_frame)))
+
+    return int(clamp(int(target_frame), lower_bound, upper_bound))
+
+
+class PolygonKeyframeTrack(QWidget):
+    frameSelected = pyqtSignal(int)
+    keyframeMoved = pyqtSignal(int, int)
+    keyframeMoveFinished = pyqtSignal(int, int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setFixedHeight(30)
+        self.setToolTip("Drag polygon keyframe markers to retime the interpolation between saved polygon states.")
+        self._minimum = 0
+        self._maximum = 0
+        self._current_frame = 0
+        self._keyframes: list[int] = []
+        self._interactive = False
+        self._message = "Select a polygon layer to edit its keyframes."
+        self._drag_index: int | None = None
+        self._drag_start_frame: int | None = None
+
+    def set_state(
+        self,
+        *,
+        minimum: int,
+        maximum: int,
+        current_frame: int,
+        keyframes: list[int],
+        interactive: bool,
+        message: str,
+    ) -> None:
+        self._minimum = int(minimum)
+        self._maximum = max(self._minimum, int(maximum))
+        self._current_frame = int(clamp(int(current_frame), self._minimum, self._maximum))
+        self._keyframes = [int(frame) for frame in keyframes]
+        self._interactive = bool(interactive)
+        self._message = str(message)
+        if self._drag_index is not None and not (0 <= self._drag_index < len(self._keyframes)):
+            self._drag_index = None
+            self._drag_start_frame = None
+        self.update()
+
+    def _track_rect(self) -> QRectF:
+        return QRectF(10.0, 7.0, max(1.0, self.width() - 20.0), max(1.0, self.height() - 14.0))
+
+    def _frame_to_x(self, frame: int) -> float:
+        rect = self._track_rect()
+        if self._maximum <= self._minimum or rect.width() <= 1e-6:
+            return rect.center().x()
+        ratio = (clamp(int(frame), self._minimum, self._maximum) - self._minimum) / float(self._maximum - self._minimum)
+        return rect.left() + ratio * rect.width()
+
+    def _frame_from_x(self, x: float) -> int:
+        rect = self._track_rect()
+        if self._maximum <= self._minimum or rect.width() <= 1e-6:
+            return self._minimum
+        ratio = clamp((float(x) - rect.left()) / rect.width(), 0.0, 1.0)
+        return int(round(self._minimum + ratio * (self._maximum - self._minimum)))
+
+    def _marker_index_at(self, x: float, y: float) -> int | None:
+        if not self._keyframes:
+            return None
+        rect = self._track_rect()
+        if float(y) < rect.top() - 6.0 or float(y) > rect.bottom() + 6.0:
+            return None
+        best_index: int | None = None
+        best_distance = 10.0
+        for index, frame in enumerate(self._keyframes):
+            distance = abs(self._frame_to_x(frame) - float(x))
+            if distance <= best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def _update_hover_cursor(self, x: float, y: float) -> None:
+        if self._interactive and self._marker_index_at(x, y) is not None:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.unsetCursor()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        outer = QRectF(2.0, 2.0, max(1.0, self.width() - 4.0), max(1.0, self.height() - 4.0))
+        painter.setPen(QPen(QColor(62, 74, 88), 1.0))
+        painter.setBrush(QColor(20, 24, 31))
+        painter.drawRoundedRect(outer, 6.0, 6.0)
+
+        track_rect = self._track_rect()
+        baseline_y = track_rect.center().y()
+        painter.setPen(QPen(QColor(76, 87, 101), 1.0))
+        painter.drawLine(QPointF(track_rect.left(), baseline_y), QPointF(track_rect.right(), baseline_y))
+
+        if self._maximum >= self._minimum:
+            current_x = self._frame_to_x(self._current_frame)
+            painter.setPen(QPen(QColor(80, 152, 255, 180), 1.5))
+            painter.drawLine(QPointF(current_x, track_rect.top() - 1.0), QPointF(current_x, track_rect.bottom() + 1.0))
+
+        if not self._keyframes:
+            painter.setPen(QColor(148, 160, 176))
+            painter.drawText(outer.adjusted(10.0, 0.0, -10.0, 0.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._message)
+            return
+
+        for index, frame in enumerate(self._keyframes):
+            marker_x = self._frame_to_x(frame)
+            is_current = int(frame) == int(self._current_frame)
+            is_dragged = index == self._drag_index
+            marker_color = QColor(255, 191, 102) if is_dragged else QColor(80, 152, 255) if is_current else QColor(228, 233, 240)
+            marker_height = track_rect.height() if is_dragged else track_rect.height() * (0.92 if is_current else 0.72)
+            marker_radius = 4.3 if is_dragged else 4.0 if is_current else 3.5
+            top_y = baseline_y - marker_height * 0.5
+            bottom_y = baseline_y + marker_height * 0.5
+
+            painter.setPen(QPen(marker_color, 2.0))
+            painter.drawLine(QPointF(marker_x, top_y), QPointF(marker_x, bottom_y))
+            painter.setBrush(marker_color)
+            painter.drawEllipse(QRectF(marker_x - marker_radius, baseline_y - marker_radius, marker_radius * 2.0, marker_radius * 2.0))
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if not self._interactive:
+            return
+
+        marker_index = self._marker_index_at(event.position().x(), event.position().y())
+        if marker_index is None:
+            self.frameSelected.emit(self._frame_from_x(event.position().x()))
+            return
+
+        self._drag_index = marker_index
+        self._drag_start_frame = self._keyframes[marker_index]
+        self.frameSelected.emit(self._keyframes[marker_index])
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_index is None:
+            self._update_hover_cursor(event.position().x(), event.position().y())
+            super().mouseMoveEvent(event)
+            return
+
+        target_frame = clamp_keyframe_frame(
+            self._keyframes,
+            self._drag_index,
+            self._frame_from_x(event.position().x()),
+            self._minimum,
+            self._maximum,
+        )
+        if target_frame == self._keyframes[self._drag_index]:
+            return
+
+        self._keyframes[self._drag_index] = target_frame
+        self._current_frame = target_frame
+        self.keyframeMoved.emit(self._drag_index, target_frame)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_index is None:
+            super().mouseReleaseEvent(event)
+            return
+
+        dragged_index = self._drag_index
+        final_frame = self._keyframes[dragged_index]
+        start_frame = self._drag_start_frame
+        self._drag_index = None
+        self._drag_start_frame = None
+        self._update_hover_cursor(event.position().x(), event.position().y())
+        self.update()
+
+        if start_frame is not None and int(final_frame) != int(start_frame):
+            self.keyframeMoveFinished.emit(dragged_index, final_frame)
+
+    def leaveEvent(self, event) -> None:
+        if self._drag_index is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+
 class MapCanvas(QWidget):
     drawingFinished = pyqtSignal(object)
     viewChanged = pyqtSignal()
+    polygonKeyframesChanged = pyqtSignal()
 
     def __init__(self, font_path: str | Path | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -349,6 +545,7 @@ class MapCanvas(QWidget):
         self._selected_vertex_index = len(keyframe.points) - 1 if (edge_index + 1) % len(keyframe.points) == 0 else edge_index + 1
         self._dragging_vertex_index = None
         self._render_now()
+        self.polygonKeyframesChanged.emit()
         return True
 
     def delete_selected_vertex(self) -> bool:
@@ -375,6 +572,7 @@ class MapCanvas(QWidget):
             self._selected_vertex_index = None
         self._dragging_vertex_index = None
         self._render_now()
+        self.polygonKeyframesChanged.emit()
         return True
 
     def begin_polygon_draw(self, target_layer_id: str | None = None) -> None:
@@ -666,6 +864,7 @@ class MapCanvas(QWidget):
             self._dragging_vertex_index = None
             self._preserve_interpolated_overlay_during_drag = False
             self._render_now()
+            self.polygonKeyframesChanged.emit()
         self.is_panning = False
         self.last_mouse_pos = None
 
@@ -830,10 +1029,22 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 0)
         root_layout.addWidget(splitter, 1)
 
+        label_width = max(QLabel("Keyframes").sizeHint().width(), QLabel("Timeline").sizeHint().width()) + 8
+
+        keyframe_timeline = QHBoxLayout()
+        self.keyframe_track_label = QLabel("Keyframes")
+        self.keyframe_track_label.setFixedWidth(label_width)
+        self.keyframe_track = PolygonKeyframeTrack()
+        keyframe_timeline.addWidget(self.keyframe_track_label)
+        keyframe_timeline.addWidget(self.keyframe_track, 1)
+        root_layout.addLayout(keyframe_timeline)
+
         timeline = QHBoxLayout()
+        timeline_title = QLabel("Timeline")
+        timeline_title.setFixedWidth(label_width)
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
         self.timeline_label = QLabel("Frame 0 / 0")
-        timeline.addWidget(QLabel("Timeline"))
+        timeline.addWidget(timeline_title)
         timeline.addWidget(self.timeline_slider, 1)
         timeline.addWidget(self.timeline_label)
         root_layout.addLayout(timeline)
@@ -855,6 +1066,9 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self._toggle_play)
         self.final_preview_button.toggled.connect(self._set_final_preview_mode)
         self.timeline_slider.valueChanged.connect(self._on_frame_changed)
+        self.keyframe_track.frameSelected.connect(self._set_current_frame)
+        self.keyframe_track.keyframeMoved.connect(self._move_selected_polygon_keyframe)
+        self.keyframe_track.keyframeMoveFinished.connect(self._announce_keyframe_move)
         self.layer_list.currentRowChanged.connect(self._populate_layer_form)
         self.color_button.clicked.connect(self._pick_color)
         self.layer_name_edit.editingFinished.connect(self._apply_layer_form)
@@ -875,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.video_format_combo.currentIndexChanged.connect(self._apply_video_format_selection)
         self.basemap_combo.currentIndexChanged.connect(self._apply_basemap_selection)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
+        self.canvas.polygonKeyframesChanged.connect(self._refresh_keyframe_track)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._advance_frame)
 
@@ -1104,6 +1319,7 @@ class MainWindow(QMainWindow):
     def _populate_layer_form(self) -> None:
         kind, layer = self._selected_layer()
         self.canvas.set_selected_polygon_layer(layer.id if kind == "polygon" and layer is not None else None)
+        self._refresh_keyframe_track()
         self._updating_form = True
         enabled = layer is not None
         for widget in [
@@ -1211,6 +1427,7 @@ class MainWindow(QMainWindow):
         else:
             self.project.route_layers = [item for item in self.project.route_layers if item.id != layer.id]
         self._refresh_layer_list()
+        self._populate_layer_form()
         self._refresh_canvas_only()
 
     def _handle_drawing_finished(self, payload: dict) -> None:
@@ -1251,6 +1468,7 @@ class MainWindow(QMainWindow):
             )
             self.project.route_layers.append(layer)
             self._refresh_layer_list()
+        self._populate_layer_form()
         self._refresh_canvas_only()
 
     def _refresh_timeline(self) -> None:
@@ -1262,11 +1480,67 @@ class MainWindow(QMainWindow):
         self.timeline_slider.blockSignals(False)
         self.timeline_label.setText(f"Frame {current} / {project_frame_max(self.project)}")
         self.play_timer.setInterval(16)
+        self._refresh_keyframe_track()
 
     def _on_frame_changed(self, value: int) -> None:
         self.timeline_label.setText(f"Frame {value} / {project_frame_max(self.project)}")
         self.canvas.set_frame_index(value)
         self._populate_layer_form()
+
+    def _set_current_frame(self, frame: int) -> None:
+        clamped_frame = max(0, min(project_frame_max(self.project), int(frame)))
+        if clamped_frame != self.timeline_slider.value():
+            self.timeline_slider.setValue(clamped_frame)
+
+    def _selected_polygon_keyframes(self) -> list[PolygonKeyframe]:
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            return []
+        return sorted(layer.keyframes, key=lambda item: int(item.frame))
+
+    def _refresh_keyframe_track(self) -> None:
+        keyframes = self._selected_polygon_keyframes()
+        if keyframes:
+            message = "Drag a marker left or right to retime the polygon interpolation."
+        else:
+            kind, layer = self._selected_layer()
+            if kind == "polygon" and layer is not None:
+                message = "This polygon layer has no keyframes yet."
+            else:
+                message = "Select a polygon layer to edit its keyframes."
+
+        self.keyframe_track.set_state(
+            minimum=0,
+            maximum=project_frame_max(self.project),
+            current_frame=self.timeline_slider.value(),
+            keyframes=[int(item.frame) for item in keyframes],
+            interactive=bool(keyframes),
+            message=message,
+        )
+
+    def _move_selected_polygon_keyframe(self, index: int, frame: int) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            return
+
+        keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+        if not (0 <= index < len(keyframes)):
+            return
+
+        frame_values = [int(item.frame) for item in keyframes]
+        clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
+        keyframes[index].frame = clamped_frame
+        keyframes.sort(key=lambda item: int(item.frame))
+        layer.keyframes = keyframes
+
+        if clamped_frame != self.timeline_slider.value():
+            self.timeline_slider.setValue(clamped_frame)
+        else:
+            self._refresh_keyframe_track()
+            self._refresh_canvas_only()
+
+    def _announce_keyframe_move(self, _index: int, frame: int) -> None:
+        self.statusBar().showMessage(f"Polygon keyframe moved to frame {frame}", 2500)
 
     def _refresh_canvas_only(self) -> None:
         self.canvas.invalidate_cache()
