@@ -40,7 +40,6 @@ from exploration_editor.geometry import (
     lonlat_to_world,
     polygon_edit_points_at_frame,
     resample_path,
-    rounded_closed_path,
     world_to_lonlat,
     unwrap_longitudes,
 )
@@ -56,7 +55,7 @@ from exploration_editor.model import (
     save_project,
 )
 from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
-from exploration_editor.render import clamp_view_state, compute_map_layout, render_frame
+from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame, render_frame
 
 
 POLYGON_COLORS = [
@@ -483,27 +482,67 @@ class MapCanvas(QWidget):
     def _nearest_editable_edge(self, x: float, y: float) -> tuple[int, float] | None:
         if self._last_layout is None:
             return None
-        points = self._editable_polygon_points()
-        if len(points) < 3:
+        raw_points = self._editable_polygon_points()
+        n = len(raw_points)
+        if n < 3:
             return None
+        layer = self._selected_polygon_layer()
         tolerance_px = max(10.0, self.height() * 0.014)
         best_match: tuple[int, float] | None = None
         best_dist_sq = tolerance_px * tolerance_px
-        for path in self._screen_variants(points):
-            for index, (start_x, start_y) in enumerate(path):
-                end_x, end_y = path[(index + 1) % len(path)]
-                delta_x = end_x - start_x
-                delta_y = end_y - start_y
+
+        smooth_paths = polygon_outline_screen_paths_at_frame(layer, self.frame_index, self._last_layout) if layer is not None else []
+        raw_screen_paths = self._screen_variants(raw_points)
+        radius = float(getattr(layer, "rounding_px", 0.0)) if layer is not None else 0.0
+        s = max(6, min(24, int(radius / 15))) if radius > 0.0 else 1
+
+        for smooth_path, raw_path in zip(smooth_paths, raw_screen_paths):
+            m = len(smooth_path)
+            if m == 0:
+                continue
+            for j in range(m):
+                sx1, sy1 = smooth_path[j]
+                sx2, sy2 = smooth_path[(j + 1) % m]
+                delta_x = sx2 - sx1
+                delta_y = sy2 - sy1
                 seg_len_sq = delta_x * delta_x + delta_y * delta_y
                 if seg_len_sq <= 1e-6:
                     continue
-                t = clamp(((x - start_x) * delta_x + (y - start_y) * delta_y) / seg_len_sq, 0.0, 1.0)
-                proj_x = start_x + delta_x * t
-                proj_y = start_y + delta_y * t
+                t_proj = clamp(((x - sx1) * delta_x + (y - sy1) * delta_y) / seg_len_sq, 0.0, 1.0)
+                proj_x = sx1 + delta_x * t_proj
+                proj_y = sy1 + delta_y * t_proj
                 dist_sq = (proj_x - x) * (proj_x - x) + (proj_y - y) * (proj_y - y)
                 if dist_sq <= best_dist_sq:
                     best_dist_sq = dist_sq
-                    best_match = (index, float(t))
+                    raw_edge = (j // s) % n
+                    rs_x1, rs_y1 = raw_path[raw_edge]
+                    rs_x2, rs_y2 = raw_path[(raw_edge + 1) % n]
+                    rdx = rs_x2 - rs_x1
+                    rdy = rs_y2 - rs_y1
+                    raw_seg_sq = rdx * rdx + rdy * rdy
+                    if raw_seg_sq > 1e-6:
+                        t_raw = clamp(((x - rs_x1) * rdx + (y - rs_y1) * rdy) / raw_seg_sq, 0.0, 1.0)
+                    else:
+                        t_raw = 0.0
+                    best_match = (raw_edge, t_raw)
+
+        # Fallback: no smooth paths available, test raw segments directly
+        if not smooth_paths:
+            for path in raw_screen_paths:
+                for index, (start_x, start_y) in enumerate(path):
+                    end_x, end_y = path[(index + 1) % len(path)]
+                    delta_x = end_x - start_x
+                    delta_y = end_y - start_y
+                    seg_len_sq = delta_x * delta_x + delta_y * delta_y
+                    if seg_len_sq <= 1e-6:
+                        continue
+                    t = clamp(((x - start_x) * delta_x + (y - start_y) * delta_y) / seg_len_sq, 0.0, 1.0)
+                    proj_x = start_x + delta_x * t
+                    proj_y = start_y + delta_y * t
+                    dist_sq = (proj_x - x) * (proj_x - x) + (proj_y - y) * (proj_y - y)
+                    if dist_sq <= best_dist_sq:
+                        best_dist_sq = dist_sq
+                        best_match = (index, float(t))
         return best_match
 
     def _interpolate_segment_point(self, start: list[float], end: list[float], t: float) -> list[float]:
@@ -699,10 +738,11 @@ class MapCanvas(QWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-        for path in self._screen_variants(points):
-            outline_path = rounded_closed_path(path, float(layer.rounding_px))
+        for outline_path in polygon_outline_screen_paths_at_frame(layer, self.frame_index, self._last_layout):
             polygon = QPolygonF([QPointF(x, y) for x, y in outline_path])
             painter.drawPolygon(polygon)
+
+        for path in self._screen_variants(points):
             for index, (x, y) in enumerate(path):
                 painter.setPen(Qt.PenStyle.NoPen)
                 if index == self._dragging_vertex_index:
@@ -762,10 +802,9 @@ class MapCanvas(QWidget):
         layout = compute_map_layout((max(2, self.width()), max(2, self.height())), self.basemap_image.size, self.project.view)
         world_x = (x - layout["offset_x"]) / layout["scale"]
         world_y = (y - layout["offset_y"]) / layout["scale"]
-        if world_x < 0.0 or world_x > self.basemap_image.width:
-            return None
         if world_y < 0.0 or world_y > self.basemap_image.height:
             return None
+        world_x = world_x % float(self.basemap_image.width)
         return world_to_lonlat(world_x, world_y, self.basemap_image.size)
 
     def _zoom_at(self, x: float, y: float, factor: float) -> None:

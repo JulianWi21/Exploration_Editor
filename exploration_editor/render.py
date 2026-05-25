@@ -8,8 +8,8 @@ import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from exploration_editor.basemap import load_basemap_image
-from exploration_editor.geometry import lonlat_to_world, path_prefix, polygon_points_at_frame, rounded_closed_path, route_progress, unwrap_longitudes
-from exploration_editor.model import Project, RouteLayer, ViewState
+from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, path_prefix, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, route_progress, unwrap_longitudes
+from exploration_editor.model import PolygonLayer, Project, RouteLayer, ViewState
 
 
 @dataclass(frozen=True)
@@ -37,10 +37,10 @@ def clamp_view_state(
     offset_x = center_x + float(view.offset_x)
     offset_y = center_y + float(view.offset_y)
 
-    if draw_w >= frame_w:
-        offset_x = min(0.0, max(frame_w - draw_w, offset_x))
-    else:
-        offset_x = center_x
+    if draw_w > 1e-6:
+        offset_x = offset_x % draw_w
+        if offset_x > 0.0:
+            offset_x -= draw_w
     if draw_h >= frame_h:
         offset_y = min(0.0, max(frame_h - draw_h, offset_y))
     else:
@@ -101,19 +101,187 @@ def _screen_path_variants(points: list[list[float]], layout: dict[str, float]) -
     return variants
 
 
+def _rounded_screen_variants(points: list[list[float]], layout: dict[str, float], radius: float) -> list[list[tuple[float, float]]]:
+    variants = _screen_path_variants(points, layout)
+    if radius <= 0.0:
+        return variants
+    return [rounded_closed_path(path, radius) for path in variants]
+
+
+_SMOOTH_RESAMPLE_COUNT = 256
+
+
+def _smooth_resampled_screen_variants(
+    points: list[list[float]],
+    layout: dict[str, float],
+    radius: float,
+) -> list[list[tuple[float, float]]]:
+    variants = _screen_path_variants(points, layout)
+    result = []
+    for variant in variants:
+        if len(variant) < 3:
+            result.append(variant)
+            continue
+        smooth = rounded_closed_path(variant, radius) if radius > 0.0 else variant
+        result.append(resample_closed_screen_path(smooth, _SMOOTH_RESAMPLE_COUNT))
+    return result
+
+
+def polygon_outline_screen_paths_at_frame(layer: PolygonLayer, frame_index: int, layout: dict[str, float]) -> list[list[tuple[float, float]]]:
+    if not layer.keyframes:
+        return []
+    radius = float(layer.rounding_px)
+    keyframes = sorted(layer.keyframes, key=lambda kf: kf.frame)
+
+    # At or before first keyframe
+    if frame_index <= keyframes[0].frame:
+        pts = [list(p) for p in keyframes[0].points]
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+
+    # At or after last keyframe
+    if frame_index >= keyframes[-1].frame:
+        pts = [list(p) for p in keyframes[-1].points]
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+
+    # Find bounding keyframes
+    left = right = None
+    for idx in range(len(keyframes) - 1):
+        if keyframes[idx].frame <= frame_index <= keyframes[idx + 1].frame:
+            left = keyframes[idx]
+            right = keyframes[idx + 1]
+            break
+    if left is None or right is None:
+        return []
+
+    # At exact keyframe boundary: Catmull-Rom through exact keyframe points
+    if frame_index == left.frame:
+        pts = [list(p) for p in left.points]
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+    if frame_index == right.frame:
+        pts = [list(p) for p in right.points]
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+
+    # Between keyframes — same topology: interpolate control points first, then smooth.
+    # The Catmull-Rom curve passes through every interpolated control point.
+    if len(left.points) == len(right.points):
+        pts = polygon_points_at_frame(layer, frame_index)
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+
+    # Between keyframes — different topology (N vs M points): place proxy points ON
+    # the source polygon's smooth Catmull-Rom arc (not on straight chords) so that
+    # at t≈0 the curve matches the source keyframe exactly, and during the transition
+    # every interpolated point stays near the polygon boundary (no wild bulging).
+    left_pts = [list(p) for p in left.points]
+    right_pts = [list(p) for p in right.points]
+    span = max(1, right.frame - left.frame)
+    raw_t = (frame_index - left.frame) / span
+    t = polygon_segment_progress(
+        left_pts, right_pts, raw_t,
+        easing=getattr(left, "outgoing_easing", None),
+        constant_area=getattr(left, "outgoing_constant_area", False),
+    )
+
+    if radius <= 0.0:
+        # No smoothing: proxy points on straight chords are fine.
+        pts = polygon_points_at_frame(layer, frame_index)
+        return _rounded_screen_variants(pts, layout, radius) if len(pts) >= 3 else []
+
+    # Determine smaller vs larger polygon.
+    if len(left_pts) <= len(right_pts):
+        smaller_pts, larger_pts = left_pts, right_pts
+        smaller_is_left = True
+    else:
+        smaller_pts, larger_pts = right_pts, left_pts
+        smaller_is_left = False
+
+    aligned_larger, structure = expand_closed_path_structure(smaller_pts, larger_pts)
+
+    result = []
+    for v_small, v_large in zip(
+        _screen_path_variants(smaller_pts, layout),
+        _screen_path_variants(aligned_larger, layout),
+    ):
+        if len(v_small) < 3:
+            result.append(v_small)
+            continue
+
+        # Smooth arc for the smaller polygon: proxy points will land on this curve.
+        small_smooth = rounded_closed_path(v_small, radius)
+        n_s = len(v_small)
+        s = len(small_smooth) // n_s if n_s > 0 else 1
+
+        if s < 2 or len(small_smooth) != n_s * s:
+            # Degenerate case: fall back to straight-chord proxies.
+            pts = polygon_points_at_frame(layer, frame_index)
+            scr = _screen_path_variants(pts, layout)
+            result.extend(rounded_closed_path(v, radius) if len(v) >= 3 else v for v in scr)
+            return result
+
+        # Build expanded screen positions: originals at their screen coords,
+        # proxies sampled from the smooth arc at the correct fractional position.
+        expanded: list[tuple[float, float]] = []
+        for item in structure:
+            if item[0] == 'original':
+                expanded.append(v_small[item[1]])
+            else:  # 'proxy'
+                edge_i: int = item[1]
+                frac: float = item[2]
+                arc_float = edge_i * s + frac * (s - 1)
+                idx0 = max(edge_i * s, min(int(arc_float), (edge_i + 1) * s - 1))
+                idx1 = min(idx0 + 1, (edge_i + 1) * s - 1)
+                f = arc_float - int(arc_float)
+                px = small_smooth[idx0][0] + f * (small_smooth[idx1][0] - small_smooth[idx0][0])
+                py = small_smooth[idx0][1] + f * (small_smooth[idx1][1] - small_smooth[idx0][1])
+                expanded.append((px, py))
+
+        # Interpolate: expanded points lie on the smaller KF's smooth arc;
+        # v_large holds the larger KF's raw screen positions.
+        if smaller_is_left:
+            interp = [(lx + t * (rx - lx), ly + t * (ry - ly))
+                      for (lx, ly), (rx, ry) in zip(expanded, v_large)]
+        else:
+            interp = [(lx + t * (rx - lx), ly + t * (ry - ly))
+                      for (lx, ly), (rx, ry) in zip(v_large, expanded)]
+
+        result.append(rounded_closed_path(interp, radius) if len(interp) >= 3 else interp)
+    return result
+
+
 def _build_map_mask(frame_size: tuple[int, int], layout: dict[str, float]) -> Image.Image:
     image = Image.new("L", frame_size, 0)
     draw = ImageDraw.Draw(image)
     draw.rectangle(
         [
-            layout["offset_x"],
+            0,
             layout["offset_y"],
-            layout["offset_x"] + layout["draw_w"],
+            frame_size[0],
             layout["offset_y"] + layout["draw_h"],
         ],
         fill=255,
     )
     return image
+
+
+def _paste_clipped(base: Image.Image, tile: Image.Image, x: int, y: int) -> None:
+    left = max(0, int(x))
+    top = max(0, int(y))
+    right = min(base.width, int(x) + tile.width)
+    bottom = min(base.height, int(y) + tile.height)
+    if right <= left or bottom <= top:
+        return
+    crop = tile.crop((left - int(x), top - int(y), right - int(x), bottom - int(y)))
+    base.paste(crop, (left, top))
+
+
+def _paste_wrapped_basemap(base: Image.Image, tile: Image.Image, layout: dict[str, float]) -> None:
+    tile_w = max(1, tile.width)
+    x = int(round(layout["offset_x"]))
+    y = int(round(layout["offset_y"]))
+    while x > 0:
+        x -= tile_w
+    while x < base.width:
+        _paste_clipped(base, tile, x, y)
+        x += tile_w
 
 
 def _lighter_mask(base: Image.Image, candidate: Image.Image) -> Image.Image:
@@ -131,14 +299,13 @@ def _build_reveal_mask(
     for layer in project.polygon_layers:
         if not layer.visible:
             continue
-        points = polygon_points_at_frame(layer, frame_index)
-        if len(points) < 3:
+        paths = polygon_outline_screen_paths_at_frame(layer, frame_index, layout)
+        if not paths:
             continue
         temp = Image.new("L", frame_size, 0)
         draw = ImageDraw.Draw(temp)
-        for path in _screen_path_variants(points, layout):
-            render_path = rounded_closed_path(path, float(layer.rounding_px))
-            draw.polygon(render_path, fill=int(255 * max(0.0, min(1.0, layer.opacity))))
+        for path in paths:
+            draw.polygon(path, fill=int(255 * max(0.0, min(1.0, layer.opacity))))
         blur_radius = max(0, int(layer.feather_px))
         if blur_radius > 0:
             temp = temp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -203,7 +370,7 @@ def prepare_frame_render(
     draw_h = max(1, int(round(layout["draw_h"])))
     resample = Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS
     scaled_map = display_basemap_image.resize((draw_w, draw_h), resample=resample)
-    background.paste(scaled_map, (int(round(layout["offset_x"])), int(round(layout["offset_y"]))))
+    _paste_wrapped_basemap(background, scaled_map, layout)
 
     map_mask = _build_map_mask((frame_w, frame_h), layout)
     return PreparedFrameRender(

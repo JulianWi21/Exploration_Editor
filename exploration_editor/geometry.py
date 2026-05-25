@@ -43,6 +43,103 @@ def _polygon_area(points: Iterable[Iterable[float]]) -> float:
     return abs(area) * 0.5
 
 
+def _without_nearly_collinear_closed_points(
+    points: list[tuple[float, float]],
+    tolerance: float,
+) -> list[tuple[float, float]]:
+    if len(points) < 4:
+        return points
+
+    keep: list[tuple[float, float]] = []
+    max_distance = max(1e-6, float(tolerance))
+    for index, current in enumerate(points):
+        previous = points[index - 1]
+        following = points[(index + 1) % len(points)]
+        segment_x = following[0] - previous[0]
+        segment_y = following[1] - previous[1]
+        segment_len_sq = segment_x * segment_x + segment_y * segment_y
+        if segment_len_sq <= 1e-9:
+            keep.append(current)
+            continue
+
+        current_x = current[0] - previous[0]
+        current_y = current[1] - previous[1]
+        projection = (current_x * segment_x + current_y * segment_y) / segment_len_sq
+        if projection < -1e-6 or projection > 1.0 + 1e-6:
+            keep.append(current)
+            continue
+
+        distance = abs(segment_x * current_y - segment_y * current_x) / math.sqrt(segment_len_sq)
+        if distance > max_distance:
+            keep.append(current)
+
+    return keep if len(keep) >= 3 else points
+
+
+def _point_distance_2d(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
+    return math.hypot(point_b[0] - point_a[0], point_b[1] - point_a[1])
+
+
+def _catmull_rom_segment(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    n: int,
+    alpha: float = 0.5,
+) -> list[tuple[float, float]]:
+    """Centripetal Catmull-Rom segment from p1 to p2 (exclusive), Barry-Goldman."""
+    d01 = max(1e-9, math.hypot(p1[0] - p0[0], p1[1] - p0[1])) ** alpha
+    d12 = max(1e-9, math.hypot(p2[0] - p1[0], p2[1] - p1[1])) ** alpha
+    d23 = max(1e-9, math.hypot(p3[0] - p2[0], p3[1] - p2[1])) ** alpha
+    t0 = 0.0
+    t1 = t0 + d01
+    t2 = t1 + d12
+    t3 = t2 + d23
+
+    result: list[tuple[float, float]] = []
+    for j in range(n):
+        t = t1 + (t2 - t1) * j / n
+        inv10 = 1.0 / max(1e-12, t1 - t0)
+        inv21 = 1.0 / max(1e-12, t2 - t1)
+        inv32 = 1.0 / max(1e-12, t3 - t2)
+        inv20 = 1.0 / max(1e-12, t2 - t0)
+        inv31 = 1.0 / max(1e-12, t3 - t1)
+
+        a1x = (t1 - t) * inv10 * p0[0] + (t - t0) * inv10 * p1[0]
+        a1y = (t1 - t) * inv10 * p0[1] + (t - t0) * inv10 * p1[1]
+        a2x = (t2 - t) * inv21 * p1[0] + (t - t1) * inv21 * p2[0]
+        a2y = (t2 - t) * inv21 * p1[1] + (t - t1) * inv21 * p2[1]
+        a3x = (t3 - t) * inv32 * p2[0] + (t - t2) * inv32 * p3[0]
+        a3y = (t3 - t) * inv32 * p2[1] + (t - t2) * inv32 * p3[1]
+
+        b1x = (t2 - t) * inv20 * a1x + (t - t0) * inv20 * a2x
+        b1y = (t2 - t) * inv20 * a1y + (t - t0) * inv20 * a2y
+        b2x = (t3 - t) * inv31 * a2x + (t - t1) * inv31 * a3x
+        b2y = (t3 - t) * inv31 * a2y + (t - t1) * inv31 * a3y
+
+        cx = (t2 - t) * inv21 * b1x + (t - t1) * inv21 * b2x
+        cy = (t2 - t) * inv21 * b1y + (t - t1) * inv21 * b2y
+        result.append((cx, cy))
+    return result
+
+
+def _smooth_closed_path(points: list[tuple[float, float]], radius: float) -> list[tuple[float, float]]:
+    """Centripetal Catmull-Rom spline – passes through every control point (closed)."""
+    n = len(points)
+    if n < 3 or radius <= 0.0:
+        return points
+    samples = max(6, min(24, int(radius / 15)))
+    result: list[tuple[float, float]] = []
+    for i in range(n):
+        p0 = points[(i - 1) % n]
+        p1 = points[i]
+        p2 = points[(i + 1) % n]
+        p3 = points[(i + 2) % n]
+        result.extend(_catmull_rom_segment(p0, p1, p2, p3, samples))
+    return result
+
+
 @lru_cache(maxsize=256)
 def _build_constant_area_curve(
     points_a_key: tuple[tuple[float, float], ...],
@@ -280,6 +377,55 @@ def _select_subsequence_indices(points_small: list[list[float]], points_large: l
     return selected
 
 
+def _rotate_points(points: list[list[float]], offset: int) -> list[list[float]]:
+    if not points:
+        return []
+    normalized_offset = int(offset) % len(points)
+    return [point[:] for point in points[normalized_offset:] + points[:normalized_offset]]
+
+
+def _closed_alignment_variants(points: list[list[float]]):
+    original = [point[:] for point in points]
+    for offset in range(len(original)):
+        yield _rotate_points(original, offset)
+    reversed_points = [point[:] for point in reversed(points)]
+    for offset in range(len(reversed_points)):
+        yield _rotate_points(reversed_points, offset)
+
+
+def _subsequence_alignment_cost(points_small: list[list[float]], points_large: list[list[float]], selected: list[int]) -> float:
+    return sum(
+        _point_distance_sq(points_small[small_index], points_large[large_index])
+        for small_index, large_index in enumerate(selected)
+    )
+
+
+def _best_closed_subsequence_alignment(points_small: list[list[float]], points_large: list[list[float]]) -> tuple[list[list[float]], list[int]]:
+    best_points = [point[:] for point in points_large]
+    best_selected = _select_subsequence_indices(points_small, best_points)
+    best_cost = _subsequence_alignment_cost(points_small, best_points, best_selected)
+
+    for candidate in _closed_alignment_variants(points_large):
+        selected = _select_subsequence_indices(points_small, candidate)
+        cost = _subsequence_alignment_cost(points_small, candidate, selected)
+        if cost < best_cost - 1e-9:
+            best_points = candidate
+            best_selected = selected
+            best_cost = cost
+    return best_points, best_selected
+
+
+def _best_closed_equal_alignment(points_a: list[list[float]], points_b: list[list[float]]) -> list[list[float]]:
+    best_points = [point[:] for point in points_b]
+    best_cost = sum(_point_distance_sq(point_a, point_b) for point_a, point_b in zip(points_a, best_points))
+    for candidate in _closed_alignment_variants(points_b):
+        cost = sum(_point_distance_sq(point_a, point_b) for point_a, point_b in zip(points_a, candidate))
+        if cost < best_cost - 1e-9:
+            best_points = candidate
+            best_cost = cost
+    return best_points
+
+
 def _cyclic_index_span(start_index: int, end_index: int, count: int) -> list[int]:
     indices = [start_index]
     current = start_index
@@ -295,7 +441,7 @@ def _expand_closed_path_to_match(points_small: list[list[float]], points_large: 
     if len(points_small) >= len(points_large):
         return [point[:] for point in points_small]
 
-    selected = _select_subsequence_indices(points_small, points_large)
+    points_large, selected = _best_closed_subsequence_alignment(points_small, points_large)
     expanded: list[list[float] | None] = [None] * len(points_large)
     for small_index, large_index in enumerate(selected):
         expanded[large_index] = points_small[small_index][:]
@@ -326,6 +472,53 @@ def _expand_closed_path_to_match(points_small: list[list[float]], points_large: 
     return [point[:] if point is not None else points_large[index][:] for index, point in enumerate(expanded)]
 
 
+def expand_closed_path_structure(
+    points_small: list[list[float]],
+    points_large: list[list[float]],
+) -> tuple[list[list[float]], list[tuple]]:
+    """Return the aligned large polygon and structural expansion metadata.
+
+    The returned structure is a list of ``len(aligned_large)`` items, one per
+    slot in the expanded polygon::
+
+        ('original', small_index)          – slot holds source point small_index
+        ('proxy', small_edge_start, frac)  – proxy on edge small_edge_start at [0,1]
+
+    Use the structure to place proxy points anywhere (e.g. on a pre-computed
+    smooth arc) instead of on the straight chord between two source control points.
+    """
+    if not points_small or len(points_small) >= len(points_large):
+        return [p[:] for p in points_large], [('original', i) for i in range(len(points_large))]
+
+    aligned_large, selected = _best_closed_subsequence_alignment(points_small, points_large)
+    structure: list[tuple | None] = [None] * len(aligned_large)
+
+    for small_index, large_index in enumerate(selected):
+        structure[large_index] = ('original', small_index)
+
+    for small_index, start_large_index in enumerate(selected):
+        next_small_index = (small_index + 1) % len(points_small)
+        end_large_index = selected[next_small_index]
+        span_indices = _cyclic_index_span(start_large_index, end_large_index, len(aligned_large))
+        if len(span_indices) <= 2:
+            continue
+
+        span_points = [aligned_large[index] for index in span_indices]
+        span_path = np.asarray(unwrap_longitudes(span_points), dtype=np.float64)
+        span_lengths = _path_lengths(span_path)
+        span_total = float(span_lengths[-1])
+        denominator = max(1, len(span_indices) - 1)
+
+        for offset, large_index in enumerate(span_indices[1:-1], start=1):
+            if span_total <= 1e-6:
+                fraction = offset / denominator
+            else:
+                fraction = float(span_lengths[offset] / span_total)
+            structure[large_index] = ('proxy', small_index, fraction)
+
+    return aligned_large, [(item if item is not None else ('original', 0)) for item in structure]
+
+
 def interpolate_paths(
     points_a: list[list[float]],
     points_b: list[list[float]],
@@ -342,14 +535,18 @@ def interpolate_paths(
     if len(points_a) == len(points_b):
         requested_samples = len(points_a) if sample_count is None else int(sample_count)
         if requested_samples == len(points_a):
+            if closed:
+                points_b = _best_closed_equal_alignment(points_a, points_b)
             return _interpolate_matched_points(points_a, points_b, t)
     if closed and len(points_a) != len(points_b):
         if len(points_a) < len(points_b):
             aligned_a = _expand_closed_path_to_match(points_a, points_b)
-            blended = _interpolate_matched_points(aligned_a, points_b, t)
+            aligned_b, _selected = _best_closed_subsequence_alignment(points_a, points_b)
+            blended = _interpolate_matched_points(aligned_a, aligned_b, t)
         else:
+            aligned_a, _selected = _best_closed_subsequence_alignment(points_b, points_a)
             aligned_b = _expand_closed_path_to_match(points_b, points_a)
-            blended = _interpolate_matched_points(points_a, aligned_b, t)
+            blended = _interpolate_matched_points(aligned_a, aligned_b, t)
         if sample_count is not None and int(sample_count) > len(blended):
             return resample_path(blended, int(sample_count), closed=True)
         return blended
@@ -404,54 +601,58 @@ def rounded_closed_path(points: Iterable[Iterable[float]], radius: float) -> lis
     path = [(float(point[0]), float(point[1])) for point in points]
     if len(path) < 3 or radius <= 0.0:
         return path
+    return _smooth_closed_path(path, float(radius))
 
-    def append_unique(target: list[tuple[float, float]], point: tuple[float, float]) -> None:
-        if not target:
-            target.append(point)
-            return
-        if math.hypot(target[-1][0] - point[0], target[-1][1] - point[1]) > 1e-6:
-            target.append(point)
 
-    rounded_segments: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float], int]] = []
-    for index, current in enumerate(path):
-        previous = path[index - 1]
-        following = path[(index + 1) % len(path)]
+def resample_closed_screen_path(points: list[tuple[float, float]], n: int) -> list[tuple[float, float]]:
+    """Uniformly resample a closed screen-space path to exactly n equidistant points."""
+    if len(points) < 2 or n < 1:
+        return list(points)
+    closed_pts = list(points) + [points[0]]
+    lengths: list[float] = [0.0]
+    for i in range(1, len(closed_pts)):
+        dx = closed_pts[i][0] - closed_pts[i - 1][0]
+        dy = closed_pts[i][1] - closed_pts[i - 1][1]
+        lengths.append(lengths[-1] + math.sqrt(dx * dx + dy * dy))
+    total = lengths[-1]
+    if total < 1e-9:
+        return [points[0]] * n
+    result: list[tuple[float, float]] = []
+    j = 0
+    for i in range(n):
+        target = total * i / n
+        while j < len(lengths) - 2 and lengths[j + 1] <= target:
+            j += 1
+        seg_len = lengths[j + 1] - lengths[j]
+        if seg_len < 1e-9:
+            result.append(closed_pts[j])
+        else:
+            frac = (target - lengths[j]) / seg_len
+            x = closed_pts[j][0] + frac * (closed_pts[j + 1][0] - closed_pts[j][0])
+            y = closed_pts[j][1] + frac * (closed_pts[j + 1][1] - closed_pts[j][1])
+            result.append((x, y))
+    return result
 
-        in_dx = previous[0] - current[0]
-        in_dy = previous[1] - current[1]
-        out_dx = following[0] - current[0]
-        out_dy = following[1] - current[1]
-        in_len = math.hypot(in_dx, in_dy)
-        out_len = math.hypot(out_dx, out_dy)
-        corner_radius = min(float(radius), in_len * 0.48, out_len * 0.48)
 
-        if corner_radius <= 1e-6 or in_len <= 1e-6 or out_len <= 1e-6:
-            rounded_segments.append((current, current, current, 1))
-            continue
-
-        start = (current[0] + (in_dx / in_len) * corner_radius, current[1] + (in_dy / in_len) * corner_radius)
-        end = (current[0] + (out_dx / out_len) * corner_radius, current[1] + (out_dy / out_len) * corner_radius)
-        steps = max(4, int(round(corner_radius / 4.0)))
-        rounded_segments.append((start, current, end, steps))
-
-    rounded_path: list[tuple[float, float]] = []
-    for start, control, end, steps in rounded_segments:
-        append_unique(rounded_path, start)
-        for step in range(1, steps):
-            t = step / float(steps)
-            one_minus_t = 1.0 - t
-            append_unique(
-                rounded_path,
-                (
-                    one_minus_t * one_minus_t * start[0] + 2.0 * one_minus_t * t * control[0] + t * t * end[0],
-                    one_minus_t * one_minus_t * start[1] + 2.0 * one_minus_t * t * control[1] + t * t * end[1],
-                ),
-            )
-        append_unique(rounded_path, end)
-
-    if len(rounded_path) > 1 and math.hypot(rounded_path[0][0] - rounded_path[-1][0], rounded_path[0][1] - rounded_path[-1][1]) <= 1e-6:
-        rounded_path.pop()
-    return rounded_path
+def best_cyclic_alignment_screen(
+    points_a: list[tuple[float, float]],
+    points_b: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Return the cyclic rotation of points_b that minimises total squared distance to points_a."""
+    n = len(points_b)
+    if n == 0:
+        return points_b
+    best_cost = float("inf")
+    best_offset = 0
+    for offset in range(n):
+        cost = sum(
+            (a[0] - points_b[(offset + i) % n][0]) ** 2 + (a[1] - points_b[(offset + i) % n][1]) ** 2
+            for i, a in enumerate(points_a)
+        )
+        if cost < best_cost:
+            best_cost = cost
+            best_offset = offset
+    return points_b[best_offset:] + points_b[:best_offset]
 
 
 def polygon_points_at_frame(layer: PolygonLayer, frame: int) -> list[list[float]]:
