@@ -140,6 +140,26 @@ def _smooth_closed_path(points: list[tuple[float, float]], radius: float) -> lis
     return result
 
 
+def _smooth_open_path(points: list[tuple[float, float]], radius: float) -> list[tuple[float, float]]:
+    """Centripetal Catmull-Rom spline – passes through every control point (open)."""
+    n = len(points)
+    if n < 2 or radius <= 0.0:
+        return points
+    samples = max(6, min(24, int(radius / 15)))
+    result: list[tuple[float, float]] = []
+    for index in range(n - 1):
+        p0 = points[max(0, index - 1)]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[min(n - 1, index + 2)]
+        segment = _catmull_rom_segment(p0, p1, p2, p3, samples)
+        if index > 0 and segment:
+            segment = segment[1:]
+        result.extend(segment)
+    result.append(points[-1])
+    return result
+
+
 @lru_cache(maxsize=256)
 def _build_constant_area_curve(
     points_a_key: tuple[tuple[float, float], ...],
@@ -602,6 +622,13 @@ def rounded_closed_path(points: Iterable[Iterable[float]], radius: float) -> lis
     if len(path) < 3 or radius <= 0.0:
         return path
     return _smooth_closed_path(path, float(radius))
+
+
+def rounded_open_path(points: Iterable[Iterable[float]], radius: float) -> list[tuple[float, float]]:
+    path = [(float(point[0]), float(point[1])) for point in points]
+    if len(path) < 2 or radius <= 0.0:
+        return path
+    return _smooth_open_path(path, float(radius))
 
 
 def resample_closed_screen_path(points: list[tuple[float, float]], n: int) -> list[tuple[float, float]]:

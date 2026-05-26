@@ -1,6 +1,6 @@
 import unittest
 
-from exploration_editor.app import clamp_keyframe_frame
+from exploration_editor.app import clamp_keyframe_frame, clamp_route_keyframe_progress
 
 
 class KeyframeClampTests(unittest.TestCase):
@@ -21,6 +21,13 @@ class KeyframeClampTests(unittest.TestCase):
 
     def test_single_keyframe_can_move_freely(self) -> None:
         self.assertEqual(clamp_keyframe_frame([15], 0, 95, 0, 100), 95)
+
+    def test_route_progress_stays_between_neighbors(self) -> None:
+        progress_values = [0.0, 0.4, 1.0]
+
+        self.assertEqual(clamp_route_keyframe_progress(progress_values, 1, -0.2), 0.0)
+        self.assertEqual(clamp_route_keyframe_progress(progress_values, 1, 0.7), 0.7)
+        self.assertEqual(clamp_route_keyframe_progress(progress_values, 1, 1.3), 1.0)
 
 
 if __name__ == "__main__":

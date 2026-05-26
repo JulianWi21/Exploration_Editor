@@ -2,7 +2,7 @@ import unittest
 
 from PIL import Image
 
-from exploration_editor.model import PolygonKeyframe, PolygonLayer, TextOverlayKeyframe, ViewState
+from exploration_editor.model import PolygonKeyframe, PolygonLayer, RouteKeyframe, RouteLayer, TextOverlayKeyframe, ViewState
 from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame
 from exploration_editor.model import Project, TextOverlayLayer
 from exploration_editor.render import render_frame
@@ -166,6 +166,74 @@ class RenderViewTests(unittest.TestCase):
         late = render_frame(project, basemap_image=basemap, frame_index=10, output_size=(320, 180), preview=True)
 
         self.assertNotEqual(list(early.getdata()), list(late.getdata()))
+
+    def test_render_frame_route_keyframes_change_visible_length(self) -> None:
+        project = Project(
+            width=320,
+            height=180,
+            fog_opacity=1.0,
+            route_layers=[
+                RouteLayer(
+                    color=[255, 0, 0],
+                    width_px=8,
+                    reveal_px=16,
+                    feather_px=0,
+                    rounding_px=90,
+                    keyframes=[
+                        RouteKeyframe(frame=0, progress=0.0),
+                        RouteKeyframe(frame=10, progress=0.25),
+                        RouteKeyframe(frame=20, progress=1.0),
+                    ],
+                    points=[[-120.0, 0.0], [-20.0, 20.0], [100.0, 0.0]],
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (320, 180), (230, 230, 230))
+
+        early = render_frame(project, basemap_image=basemap, frame_index=10, output_size=(320, 180), preview=True)
+        late = render_frame(project, basemap_image=basemap, frame_index=20, output_size=(320, 180), preview=True)
+
+        self.assertNotEqual(list(early.getdata()), list(late.getdata()))
+
+    def test_render_frame_route_reveal_only_skips_colored_overlay(self) -> None:
+        reveal_only_project = Project(
+            width=320,
+            height=180,
+            fog_opacity=1.0,
+            route_layers=[
+                RouteLayer(
+                    color=[255, 0, 0],
+                    width_px=10,
+                    reveal_px=18,
+                    feather_px=0,
+                    draw_mode="reveal_only",
+                    keyframes=[RouteKeyframe(frame=0, progress=1.0)],
+                    points=[[-60.0, 0.0], [60.0, 0.0]],
+                )
+            ],
+        )
+        colored_project = Project(
+            width=320,
+            height=180,
+            fog_opacity=1.0,
+            route_layers=[
+                RouteLayer(
+                    color=[255, 0, 0],
+                    width_px=10,
+                    reveal_px=18,
+                    feather_px=0,
+                    draw_mode="colored",
+                    keyframes=[RouteKeyframe(frame=0, progress=1.0)],
+                    points=[[-60.0, 0.0], [60.0, 0.0]],
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (320, 180), (230, 230, 230))
+
+        reveal_only = render_frame(reveal_only_project, basemap_image=basemap, frame_index=0, output_size=(320, 180), preview=True)
+        colored = render_frame(colored_project, basemap_image=basemap, frame_index=0, output_size=(320, 180), preview=True)
+
+        self.assertNotEqual(list(reveal_only.getdata()), list(colored.getdata()))
 
 
 if __name__ == "__main__":

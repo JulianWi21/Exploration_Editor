@@ -53,6 +53,7 @@ from exploration_editor.model import (
     PolygonKeyframe,
     PolygonLayer,
     Project,
+    RouteKeyframe,
     RouteLayer,
     TextOverlayKeyframe,
     TextOverlayLayer,
@@ -61,6 +62,7 @@ from exploration_editor.model import (
     interpolate_project_year,
     load_project,
     project_time_label,
+    route_layer_progress_at_frame,
     save_project,
     text_overlay_template_at_frame,
 )
@@ -108,6 +110,10 @@ TEXT_ALIGN_OPTIONS = [
     ("Center", "center"),
     ("Right", "right"),
 ]
+ROUTE_DRAW_MODE_OPTIONS = [
+    ("Colored Line", "colored"),
+    ("Reveal Only", "reveal_only"),
+]
 
 
 def _pil_to_qimage(image) -> QImage:
@@ -133,6 +139,22 @@ def clamp_keyframe_frame(keyframes: list[int], index: int, target_frame: int, mi
         lower_bound = upper_bound = max(minimum_frame, min(maximum_frame, int(target_frame)))
 
     return int(clamp(int(target_frame), lower_bound, upper_bound))
+
+
+def clamp_route_keyframe_progress(progresses: list[float], index: int, target_progress: float) -> float:
+    lower_bound = 0.0
+    upper_bound = 1.0
+
+    if 0 <= index < len(progresses):
+        if index > 0:
+            lower_bound = max(lower_bound, float(progresses[index - 1]))
+        if index + 1 < len(progresses):
+            upper_bound = min(upper_bound, float(progresses[index + 1]))
+
+    if lower_bound > upper_bound:
+        lower_bound = upper_bound = max(0.0, min(1.0, float(target_progress)))
+
+    return float(clamp(float(target_progress), lower_bound, upper_bound))
 
 
 class PolygonKeyframeTrack(QWidget):
@@ -1199,16 +1221,47 @@ class MainWindow(QMainWindow):
         self.route_width_spin.setRange(1, 60)
         self.route_reveal_spin = QSpinBox()
         self.route_reveal_spin.setRange(4, 160)
+        self.route_feather_spin = QSpinBox()
+        self.route_feather_spin.setRange(0, 200)
+        self.route_rounding_spin = QSpinBox()
+        self.route_rounding_spin.setRange(0, 400)
+        self.route_draw_mode_combo = QComboBox()
+        for label, value in ROUTE_DRAW_MODE_OPTIONS:
+            self.route_draw_mode_combo.addItem(label, value)
         self.route_start_spin = QSpinBox()
         self.route_end_spin = QSpinBox()
         self.route_label_edit = QLineEdit()
         self.route_legend_check = QCheckBox()
+        self.route_keyframe_status_label = QLabel("Route timing uses Start Frame and End Frame.")
+        self.route_keyframe_status_label.setWordWrap(True)
+        self.route_progress_spin = QDoubleSpinBox()
+        self.route_progress_spin.setRange(0.0, 100.0)
+        self.route_progress_spin.setDecimals(1)
+        self.route_progress_spin.setSingleStep(1.0)
+        self.route_progress_spin.setSuffix(" %")
+        self.route_progress_spin.setToolTip("Visible share of the route path at the current exact route keyframe.")
+        self.set_route_keyframe_button = QPushButton("Set Route Keyframe")
+        self.set_route_keyframe_button.setToolTip("Create or update a route timing marker at the current frame.")
+        self.delete_route_keyframe_button = QPushButton("Delete Route Keyframe")
+        self.delete_route_keyframe_button.setToolTip("Remove the route timing marker that exists exactly at the current frame.")
+        route_keyframe_buttons = QWidget()
+        route_keyframe_buttons_layout = QHBoxLayout(route_keyframe_buttons)
+        route_keyframe_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        route_keyframe_buttons_layout.setSpacing(6)
+        route_keyframe_buttons_layout.addWidget(self.set_route_keyframe_button)
+        route_keyframe_buttons_layout.addWidget(self.delete_route_keyframe_button)
         route_form.addRow("Route Width", self.route_width_spin)
         route_form.addRow("Reveal Width", self.route_reveal_spin)
+        route_form.addRow("Feather", self.route_feather_spin)
+        route_form.addRow("Rounding", self.route_rounding_spin)
+        route_form.addRow("Render Style", self.route_draw_mode_combo)
         route_form.addRow("Start Frame", self.route_start_spin)
         route_form.addRow("End Frame", self.route_end_spin)
         route_form.addRow("Legend Label", self.route_label_edit)
         route_form.addRow("Show Legend", self.route_legend_check)
+        route_form.addRow("Timing", self.route_keyframe_status_label)
+        route_form.addRow("Reveal Progress", self.route_progress_spin)
+        route_form.addRow("Keyframe", route_keyframe_buttons)
 
         self.text_props_group = QGroupBox("Text")
         text_form = QFormLayout(self.text_props_group)
@@ -1357,8 +1410,8 @@ class MainWindow(QMainWindow):
         self.final_preview_button.toggled.connect(self._set_final_preview_mode)
         self.timeline_slider.valueChanged.connect(self._on_frame_changed)
         self.keyframe_track.frameSelected.connect(self._set_current_frame)
-        self.keyframe_track.keyframeMoved.connect(self._move_selected_polygon_keyframe)
-        self.keyframe_track.keyframeMoveFinished.connect(self._announce_keyframe_move)
+        self.keyframe_track.keyframeMoved.connect(self._move_selected_layer_keyframe)
+        self.keyframe_track.keyframeMoveFinished.connect(self._announce_layer_keyframe_move)
         self.time_track.frameSelected.connect(self._set_current_frame)
         self.time_track.keyframeMoved.connect(self._move_project_time_keyframe)
         self.time_track.keyframeMoveFinished.connect(self._announce_time_keyframe_move)
@@ -1375,10 +1428,16 @@ class MainWindow(QMainWindow):
         self.polygon_easing_combo.currentIndexChanged.connect(self._apply_polygon_easing)
         self.route_width_spin.valueChanged.connect(self._apply_layer_form)
         self.route_reveal_spin.valueChanged.connect(self._apply_layer_form)
+        self.route_feather_spin.valueChanged.connect(self._apply_layer_form)
+        self.route_rounding_spin.valueChanged.connect(self._apply_layer_form)
+        self.route_draw_mode_combo.currentIndexChanged.connect(self._apply_layer_form)
         self.route_start_spin.valueChanged.connect(self._apply_layer_form)
         self.route_end_spin.valueChanged.connect(self._apply_layer_form)
         self.route_label_edit.editingFinished.connect(self._apply_layer_form)
         self.route_legend_check.stateChanged.connect(self._apply_layer_form)
+        self.route_progress_spin.valueChanged.connect(self._apply_route_keyframe_form)
+        self.set_route_keyframe_button.clicked.connect(self._set_route_keyframe)
+        self.delete_route_keyframe_button.clicked.connect(self._delete_route_keyframe)
         self.text_template_edit.textChanged.connect(self._apply_layer_form)
         self.set_text_keyframe_button.clicked.connect(self._set_text_keyframe)
         self.delete_text_keyframe_button.clicked.connect(self._delete_text_keyframe)
@@ -1722,6 +1781,52 @@ class MainWindow(QMainWindow):
                 return keyframe
         return None
 
+    def _selected_route_keyframe_at_current_frame(self, layer: RouteLayer) -> RouteKeyframe | None:
+        current_frame = int(self.timeline_slider.value())
+        for keyframe in sorted(layer.keyframes, key=lambda item: int(item.frame)):
+            if int(keyframe.frame) == current_frame:
+                return keyframe
+        return None
+
+    def _route_track_keyframes(self, layer: RouteLayer) -> list[RouteKeyframe]:
+        if layer.keyframes:
+            return sorted(layer.keyframes, key=lambda item: int(item.frame))
+
+        start_frame = int(layer.start_frame)
+        end_frame = max(start_frame, int(layer.end_frame))
+        if end_frame == start_frame:
+            return [RouteKeyframe(frame=start_frame, progress=0.0)]
+        return [
+            RouteKeyframe(frame=start_frame, progress=0.0),
+            RouteKeyframe(frame=end_frame, progress=1.0),
+        ]
+
+    def _sync_route_keyframes(self, layer: RouteLayer) -> None:
+        if not layer.keyframes:
+            return
+        layer.keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+        layer.start_frame = int(layer.keyframes[0].frame)
+        layer.end_frame = int(layer.keyframes[-1].frame)
+
+    def _populate_route_form(self, layer: RouteLayer) -> None:
+        current_frame = int(self.timeline_slider.value())
+        exact_keyframe = self._selected_route_keyframe_at_current_frame(layer)
+        current_progress = route_layer_progress_at_frame(layer, current_frame)
+        has_explicit_keyframes = bool(layer.keyframes)
+
+        self.route_progress_spin.setValue(float(current_progress) * 100.0)
+        self.route_start_spin.setEnabled(not has_explicit_keyframes)
+        self.route_end_spin.setEnabled(not has_explicit_keyframes)
+        if exact_keyframe is not None:
+            status = f"Editing route keyframe at frame {current_frame}."
+        elif has_explicit_keyframes:
+            status = "Move the timeline to an exact route keyframe to change the reveal progress."
+        else:
+            status = "Route timing uses Start Frame and End Frame. Use Set Route Keyframe for extra speed changes."
+        self.route_keyframe_status_label.setText(status)
+        self.set_route_keyframe_button.setText("Update Route Keyframe" if exact_keyframe is not None else "Set Route Keyframe")
+        self.delete_route_keyframe_button.setEnabled(exact_keyframe is not None)
+
     def _set_time_keyframe(self) -> None:
         current_frame = int(self.timeline_slider.value())
         keyframe = self._selected_time_keyframe_at_current_frame()
@@ -1761,6 +1866,14 @@ class MainWindow(QMainWindow):
             self.layer_visible_check.setChecked(False)
             self._set_color_button([255, 255, 255])
             self.polygon_opacity_spin.setValue(1.0)
+            self.route_keyframe_status_label.setText("Route timing uses Start Frame and End Frame.")
+            self.route_progress_spin.setValue(0.0)
+            self.set_route_keyframe_button.setText("Set Route Keyframe")
+            self.set_route_keyframe_button.setEnabled(False)
+            self.delete_route_keyframe_button.setEnabled(False)
+            self.route_feather_spin.setValue(12)
+            self.route_rounding_spin.setValue(120)
+            self.route_draw_mode_combo.setCurrentIndex(max(0, self.route_draw_mode_combo.findData("colored")))
             self.text_keyframe_status_label.setText("Default text used for this layer.")
             self.text_template_edit.setPlainText("")
             self.set_text_keyframe_button.setText("Set Text Keyframe")
@@ -1803,10 +1916,16 @@ class MainWindow(QMainWindow):
         elif is_route:
             self.route_width_spin.setValue(layer.width_px)
             self.route_reveal_spin.setValue(layer.reveal_px)
+            self.route_feather_spin.setValue(getattr(layer, "feather_px", 12))
+            self.route_rounding_spin.setValue(getattr(layer, "rounding_px", 120))
             self.route_start_spin.setValue(layer.start_frame)
             self.route_end_spin.setValue(layer.end_frame)
             self.route_label_edit.setText(layer.label)
             self.route_legend_check.setChecked(layer.show_in_legend)
+            draw_mode_index = self.route_draw_mode_combo.findData(getattr(layer, "draw_mode", "colored"))
+            self.route_draw_mode_combo.setCurrentIndex(max(0, draw_mode_index))
+            self.set_route_keyframe_button.setEnabled(True)
+            self._populate_route_form(layer)
             self._populate_polygon_easing_form(None, None, False)
         else:
             self.text_opacity_spin.setValue(layer.opacity)
@@ -1920,6 +2039,29 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Polygon segment easing set: {easing_label}", 2500)
         self._refresh_canvas_only()
 
+    def _apply_route_keyframe_form(self) -> None:
+        if self._updating_form:
+            return
+        kind, layer = self._selected_layer()
+        if kind != "route" or layer is None:
+            return
+
+        keyframe = self._selected_route_keyframe_at_current_frame(layer)
+        if keyframe is None:
+            return
+
+        keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+        index = next((item_index for item_index, item in enumerate(keyframes) if item is keyframe), -1)
+        if index < 0:
+            return
+
+        keyframe.progress = clamp_route_keyframe_progress(
+            [float(item.progress) for item in keyframes],
+            index,
+            float(self.route_progress_spin.value()) / 100.0,
+        )
+        self._refresh_canvas_only()
+
     def _apply_layer_form(self) -> None:
         if self._updating_form:
             return
@@ -1936,8 +2078,14 @@ class MainWindow(QMainWindow):
         elif kind == "route":
             layer.width_px = int(self.route_width_spin.value())
             layer.reveal_px = int(self.route_reveal_spin.value())
-            layer.start_frame = int(self.route_start_spin.value())
-            layer.end_frame = max(layer.start_frame, int(self.route_end_spin.value()))
+            layer.feather_px = int(self.route_feather_spin.value())
+            layer.rounding_px = int(self.route_rounding_spin.value())
+            layer.draw_mode = str(self.route_draw_mode_combo.currentData() or "colored")
+            if layer.keyframes:
+                self._sync_route_keyframes(layer)
+            else:
+                layer.start_frame = int(self.route_start_spin.value())
+                layer.end_frame = max(layer.start_frame, int(self.route_end_spin.value()))
             layer.label = self.route_label_edit.text().strip()
             layer.show_in_legend = self.route_legend_check.isChecked()
         else:
@@ -2054,6 +2202,7 @@ class MainWindow(QMainWindow):
             layer.text_keyframes.append(keyframe)
 
         layer.text_keyframes.sort(key=lambda item: int(item.frame))
+        self._refresh_keyframe_track()
         self._populate_layer_form()
         self._refresh_canvas_only()
         self.statusBar().showMessage(f"Text keyframe set at frame {current_frame}", 2500)
@@ -2071,9 +2220,69 @@ class MainWindow(QMainWindow):
             return
 
         layer.text_keyframes = [item for item in layer.text_keyframes if int(item.frame) != current_frame]
+        self._refresh_keyframe_track()
         self._populate_layer_form()
         self._refresh_canvas_only()
         self.statusBar().showMessage(f"Text keyframe deleted at frame {current_frame}", 2500)
+
+    def _set_route_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "route" or layer is None:
+            QMessageBox.information(self, "Route Keyframe", "Select a route layer first.")
+            return
+
+        current_frame = int(self.timeline_slider.value())
+        if not layer.keyframes:
+            layer.keyframes = [
+                RouteKeyframe(frame=int(item.frame), progress=float(item.progress))
+                for item in self._route_track_keyframes(layer)
+            ]
+
+        keyframe = self._selected_route_keyframe_at_current_frame(layer)
+        if keyframe is None:
+            keyframe = RouteKeyframe(
+                frame=current_frame,
+                progress=route_layer_progress_at_frame(layer, current_frame),
+            )
+            layer.keyframes.append(keyframe)
+
+        layer.keyframes.sort(key=lambda item: int(item.frame))
+        keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+        keyframe_index = next((index for index, item in enumerate(keyframes) if item is keyframe), -1)
+        if keyframe_index >= 0:
+            keyframe.progress = clamp_route_keyframe_progress(
+                [float(item.progress) for item in keyframes],
+                keyframe_index,
+                float(self.route_progress_spin.value()) / 100.0,
+            )
+        self._sync_route_keyframes(layer)
+        self._refresh_keyframe_track()
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Route keyframe set at frame {current_frame}", 2500)
+
+    def _delete_route_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "route" or layer is None:
+            QMessageBox.information(self, "Delete Route Keyframe", "Select a route layer first.")
+            return
+
+        current_frame = int(self.timeline_slider.value())
+        existing = self._selected_route_keyframe_at_current_frame(layer)
+        if existing is None:
+            QMessageBox.information(self, "Delete Route Keyframe", f"No route keyframe at frame {current_frame}.")
+            return
+
+        if len(layer.keyframes) <= 2:
+            self._sync_route_keyframes(layer)
+            layer.keyframes = []
+        else:
+            layer.keyframes = [item for item in layer.keyframes if int(item.frame) != current_frame]
+            self._sync_route_keyframes(layer)
+        self._refresh_keyframe_track()
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Route keyframe deleted at frame {current_frame}", 2500)
 
     def _insert_current_keyframe(self) -> None:
         kind, layer = self._selected_layer()
@@ -2165,6 +2374,10 @@ class MainWindow(QMainWindow):
                 label=f"Route {len(self.project.route_layers) + 1}",
                 start_frame=frame_index,
                 end_frame=end_frame,
+                keyframes=[
+                    RouteKeyframe(frame=frame_index, progress=0.0),
+                    RouteKeyframe(frame=end_frame, progress=1.0),
+                ],
                 points=points,
             )
             self.project.route_layers.append(layer)
@@ -2196,12 +2409,6 @@ class MainWindow(QMainWindow):
         if clamped_frame != self.timeline_slider.value():
             self.timeline_slider.setValue(clamped_frame)
 
-    def _selected_polygon_keyframes(self) -> list[PolygonKeyframe]:
-        kind, layer = self._selected_layer()
-        if kind != "polygon" or layer is None:
-            return []
-        return sorted(layer.keyframes, key=lambda item: int(item.frame))
-
     def _update_timeline_label(self, frame: int) -> None:
         label = f"Frame {int(frame)} / {project_frame_max(self.project)}"
         time_label = project_time_label(self.project, int(frame))
@@ -2210,15 +2417,22 @@ class MainWindow(QMainWindow):
         self.timeline_label.setText(label)
 
     def _refresh_keyframe_track(self) -> None:
-        keyframes = self._selected_polygon_keyframes()
-        if keyframes:
-            message = "Drag a marker left or right to retime the polygon interpolation."
-        else:
-            kind, layer = self._selected_layer()
-            if kind == "polygon" and layer is not None:
-                message = "This polygon layer has no keyframes yet."
+        kind, layer = self._selected_layer()
+        if kind == "polygon" and layer is not None:
+            keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+            message = "Drag a marker left or right to retime the polygon interpolation." if keyframes else "This polygon layer has no keyframes yet."
+        elif kind == "text" and layer is not None:
+            keyframes = sorted(layer.text_keyframes, key=lambda item: int(item.frame))
+            message = "Drag a marker left or right to retime this text change." if keyframes else "Use Set Text Keyframe to add timed text changes."
+        elif kind == "route" and layer is not None:
+            keyframes = self._route_track_keyframes(layer)
+            if layer.keyframes:
+                message = "Drag a marker left or right to retime this route reveal."
             else:
-                message = "Select a polygon layer to edit its keyframes."
+                message = "Drag Start/End markers or use Set Route Keyframe for intermediate speed changes."
+        else:
+            keyframes = []
+            message = "Select a layer to edit its keyframes."
 
         self.keyframe_track.set_state(
             minimum=0,
@@ -2241,29 +2455,66 @@ class MainWindow(QMainWindow):
             message=message,
         )
 
-    def _move_selected_polygon_keyframe(self, index: int, frame: int) -> None:
+    def _move_selected_layer_keyframe(self, index: int, frame: int) -> None:
         kind, layer = self._selected_layer()
-        if kind != "polygon" or layer is None:
+        if layer is None:
             return
 
-        keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
-        if not (0 <= index < len(keyframes)):
+        if kind == "polygon":
+            keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+            if not (0 <= index < len(keyframes)):
+                return
+            frame_values = [int(item.frame) for item in keyframes]
+            clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
+            keyframes[index].frame = clamped_frame
+            keyframes.sort(key=lambda item: int(item.frame))
+            layer.keyframes = keyframes
+        elif kind == "text":
+            keyframes = sorted(layer.text_keyframes, key=lambda item: int(item.frame))
+            if not (0 <= index < len(keyframes)):
+                return
+            frame_values = [int(item.frame) for item in keyframes]
+            clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
+            keyframes[index].frame = clamped_frame
+            keyframes.sort(key=lambda item: int(item.frame))
+            layer.text_keyframes = keyframes
+        elif kind == "route":
+            keyframes = self._route_track_keyframes(layer)
+            if not (0 <= index < len(keyframes)):
+                return
+            frame_values = [int(item.frame) for item in keyframes]
+            clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
+            if layer.keyframes:
+                layer.keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+                layer.keyframes[index].frame = clamped_frame
+                self._sync_route_keyframes(layer)
+            else:
+                if index == 0:
+                    layer.start_frame = clamped_frame
+                else:
+                    layer.end_frame = clamped_frame
+                if layer.end_frame < layer.start_frame:
+                    layer.end_frame = layer.start_frame
+            keyframes = self._route_track_keyframes(layer)
+        else:
             return
-
-        frame_values = [int(item.frame) for item in keyframes]
-        clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
-        keyframes[index].frame = clamped_frame
-        keyframes.sort(key=lambda item: int(item.frame))
-        layer.keyframes = keyframes
 
         if clamped_frame != self.timeline_slider.value():
             self.timeline_slider.setValue(clamped_frame)
         else:
             self._refresh_keyframe_track()
+            self._populate_layer_form()
             self._refresh_canvas_only()
 
-    def _announce_keyframe_move(self, _index: int, frame: int) -> None:
-        self.statusBar().showMessage(f"Polygon keyframe moved to frame {frame}", 2500)
+    def _announce_layer_keyframe_move(self, _index: int, frame: int) -> None:
+        kind, _layer = self._selected_layer()
+        if kind == "text":
+            noun = "Text"
+        elif kind == "route":
+            noun = "Route"
+        else:
+            noun = "Polygon"
+        self.statusBar().showMessage(f"{noun} keyframe moved to frame {frame}", 2500)
 
     def _move_project_time_keyframe(self, index: int, frame: int) -> None:
         keyframes = sorted(self.project.time_keyframes, key=lambda item: int(item.frame))

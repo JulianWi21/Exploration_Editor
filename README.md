@@ -91,6 +91,8 @@ Useful overrides:
 - Each text layer can appear or disappear via `Frame Start` / `Frame End`, and can also switch to different text at exact frames with `Set Text Keyframe` inside the Text panel.
 - The separate `Time` track maps frames to years through draggable project-level time keyframes, so historical timelines can be linear, non-linear, or jumpy.
 - `Time Label` is optional and only overrides the exact keyframe where it is set; otherwise the editor formats the interpolated year automatically.
+- Route layers now support draggable route timing keyframes, rounded corners, feathered reveal masks, and a `Reveal Only` mode when you want the route to behave like a fog-of-war reveal instead of a colored line.
+- If you want a fully custom route legend, disable the built-in route legend per route and use normal Text layers instead; those text boxes can already be shown, hidden, and text-keyframed over time.
 
 ## Notes
 

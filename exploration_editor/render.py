@@ -8,8 +8,8 @@ import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from exploration_editor.basemap import load_basemap_image
-from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, path_prefix, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, route_progress, unwrap_longitudes
-from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template, text_overlay_template_at_frame
+from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, rounded_open_path, unwrap_longitudes
+from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template, route_layer_progress_at_frame, text_overlay_template_at_frame
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,77 @@ def _screen_path_variants(points: list[list[float]], layout: dict[str, float]) -
             for x, y in base_points
         ])
     return variants
+
+
+def _screen_path_prefix(path: list[tuple[float, float]], progress: float) -> list[tuple[float, float]]:
+    if not path:
+        return []
+    if len(path) == 1:
+        return [path[0]]
+
+    clamped_progress = max(0.0, min(1.0, float(progress)))
+    if clamped_progress <= 0.0:
+        return [path[0]]
+    if clamped_progress >= 1.0:
+        return list(path)
+
+    cumulative_lengths = [0.0]
+    for start, end in zip(path, path[1:]):
+        cumulative_lengths.append(cumulative_lengths[-1] + float(np.hypot(end[0] - start[0], end[1] - start[1])))
+
+    total_length = cumulative_lengths[-1]
+    if total_length <= 1e-6:
+        return [path[0]]
+
+    target_length = total_length * clamped_progress
+    result = [path[0]]
+    for index, (start, end) in enumerate(zip(path, path[1:])):
+        start_length = cumulative_lengths[index]
+        end_length = cumulative_lengths[index + 1]
+        if target_length >= end_length:
+            result.append(end)
+            continue
+        segment_length = max(1e-6, end_length - start_length)
+        t = (target_length - start_length) / segment_length
+        result.append(
+            (
+                start[0] + (end[0] - start[0]) * t,
+                start[1] + (end[1] - start[1]) * t,
+            )
+        )
+        break
+    return result
+
+
+def _route_screen_variants(layer: RouteLayer, frame_index: int, layout: dict[str, float]) -> list[list[tuple[float, float]]]:
+    if len(layer.points) < 2:
+        return []
+    progress = route_layer_progress_at_frame(layer, frame_index)
+    if progress <= 0.0:
+        return []
+
+    variants = _screen_path_variants(layer.points, layout)
+    result: list[list[tuple[float, float]]] = []
+    for variant in variants:
+        smooth_path = rounded_open_path(variant, float(getattr(layer, "rounding_px", 0.0)))
+        result.append(_screen_path_prefix(smooth_path, progress))
+    return result
+
+
+def _draw_round_capped_polyline(draw: ImageDraw.ImageDraw, path: list[tuple[float, float]], fill, width: int) -> None:
+    if not path:
+        return
+    radius = max(1.0, float(width) * 0.5)
+    if len(path) == 1:
+        px, py = path[0]
+        draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=fill)
+        return
+
+    draw.line(path, fill=fill, width=max(1, int(width)), joint="curve")
+    start_x, start_y = path[0]
+    end_x, end_y = path[-1]
+    draw.ellipse([start_x - radius, start_y - radius, start_x + radius, start_y + radius], fill=fill)
+    draw.ellipse([end_x - radius, end_y - radius, end_x + radius, end_y + radius], fill=fill)
 
 
 def _rounded_screen_variants(points: list[list[float]], layout: dict[str, float], radius: float) -> list[list[tuple[float, float]]]:
@@ -327,17 +398,13 @@ def _build_reveal_mask(
     for layer in project.route_layers:
         if not layer.visible or len(layer.points) < 2:
             continue
-        progress = route_progress(frame_index, layer.start_frame, layer.end_frame)
-        if progress <= 0.0:
-            continue
-        route_points = path_prefix(layer.points, progress)
         temp = Image.new("L", frame_size, 0)
         draw = ImageDraw.Draw(temp)
-        for path in _screen_path_variants(route_points, layout):
-            if len(path) >= 2:
-                draw.line(path, fill=255, width=max(2, int(layer.reveal_px)), joint="curve")
-        blur_radius = max(1, int(layer.reveal_px * 0.45))
-        temp = temp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        for path in _route_screen_variants(layer, frame_index, layout):
+            _draw_round_capped_polyline(draw, path, fill=255, width=max(1, int(layer.reveal_px)))
+        blur_radius = max(0, int(getattr(layer, "feather_px", 0)))
+        if blur_radius > 0:
+            temp = temp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
         reveal = _lighter_mask(reveal, temp)
 
     return reveal
@@ -503,19 +570,14 @@ def _draw_routes(
     for layer in project.route_layers:
         if not layer.visible or len(layer.points) < 2:
             continue
-        progress = route_progress(frame_index, layer.start_frame, layer.end_frame)
-        if progress <= 0.0:
+        if route_layer_progress_at_frame(layer, frame_index) <= 0.0:
             continue
-        route_points = path_prefix(layer.points, progress)
-        for path in _screen_path_variants(route_points, layout):
-            if len(path) >= 2:
-                halo_width = max(3, int(layer.width_px) + 4)
-                draw.line(path, fill=(255, 255, 255, 155), width=halo_width, joint="curve")
-                draw.line(path, fill=tuple(layer.color[:3]) + (235,), width=max(1, int(layer.width_px)), joint="curve")
-            elif len(path) == 1:
-                px, py = path[0]
-                radius = max(3, int(layer.width_px))
-                draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=tuple(layer.color[:3]) + (235,))
+        if str(getattr(layer, "draw_mode", "colored")) == "reveal_only":
+            continue
+        for path in _route_screen_variants(layer, frame_index, layout):
+            halo_width = max(3, int(layer.width_px) + 4)
+            _draw_round_capped_polyline(draw, path, fill=(255, 255, 255, 155), width=halo_width)
+            _draw_round_capped_polyline(draw, path, fill=tuple(layer.color[:3]) + (235,), width=max(1, int(layer.width_px)))
     composed = Image.alpha_composite(frame_img.convert("RGBA"), overlay)
     frame_img.paste(composed.convert("RGB"), (0, 0))
 
@@ -530,7 +592,7 @@ def _draw_legend(
     for layer in project.route_layers:
         if not layer.visible or not layer.show_in_legend:
             continue
-        if route_progress(frame_index, layer.start_frame, layer.end_frame) <= 0.0:
+        if route_layer_progress_at_frame(layer, frame_index) <= 0.0:
             continue
         visible_layers.append(layer)
     if not visible_layers:
@@ -576,8 +638,12 @@ def _draw_legend(
     text_x = sample_x2 + pad_x
     for layer, text, box in zip(visible_layers, labels, label_boxes):
         cy = cursor_y + (box[3] - box[1]) * 0.5
-        draw.line([(sample_x1, cy), (sample_x2, cy)], fill=(255, 255, 255, 140), width=sample_line_w + 3)
-        draw.line([(sample_x1, cy), (sample_x2, cy)], fill=tuple(layer.color[:3]) + (235,), width=sample_line_w)
+        sample_path = [(sample_x1, cy), (sample_x2, cy)]
+        if str(getattr(layer, "draw_mode", "colored")) == "reveal_only":
+            _draw_round_capped_polyline(draw, sample_path, fill=(235, 240, 246, 200), width=sample_line_w)
+        else:
+            _draw_round_capped_polyline(draw, sample_path, fill=(255, 255, 255, 140), width=sample_line_w + 3)
+            _draw_round_capped_polyline(draw, sample_path, fill=tuple(layer.color[:3]) + (235,), width=sample_line_w)
         draw.text((text_x, cursor_y), text, font=item_font, fill=(240, 244, 248, 230))
         cursor_y += line_height + line_gap
 

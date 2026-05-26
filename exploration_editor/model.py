@@ -76,12 +76,22 @@ class RouteLayer:
     color: list[int] = field(default_factory=lambda: [190, 228, 255])
     width_px: int = 6
     reveal_px: int = 28
+    feather_px: int = 12
+    rounding_px: int = 120
     start_frame: int = 0
     end_frame: int = 120
     label: str = ""
     show_in_legend: bool = True
+    draw_mode: str = "colored"
     visible: bool = True
     points: list[list[float]] = field(default_factory=list)
+    keyframes: list["RouteKeyframe"] = field(default_factory=list)
+
+
+@dataclass
+class RouteKeyframe:
+    frame: int
+    progress: float = 0.0
 
 
 @dataclass
@@ -219,18 +229,30 @@ def _polygon_from_dict(data: dict[str, Any]) -> PolygonLayer:
 
 
 def _route_from_dict(data: dict[str, Any]) -> RouteLayer:
+    keyframes = [
+        RouteKeyframe(
+            frame=int(item.get("frame", 0)),
+            progress=max(0.0, min(1.0, float(item.get("progress", 0.0)))),
+        )
+        for item in data.get("keyframes", data.get("route_keyframes", []))
+    ]
+    keyframes.sort(key=lambda item: int(item.frame))
     return RouteLayer(
         id=str(data.get("id") or _uid("route")),
         name=str(data.get("name") or "Route"),
-        color=[int(v) for v in data.get("color", [190, 228, 255])[:3]],
-        width_px=int(data.get("width_px", 6)),
-        reveal_px=int(data.get("reveal_px", 28)),
+        color=_coerce_color(data.get("color", [190, 228, 255]), [190, 228, 255]),
+        width_px=max(1, int(data.get("width_px", 6))),
+        reveal_px=max(1, int(data.get("reveal_px", 28))),
+        feather_px=max(0, int(data.get("feather_px", 12))),
+        rounding_px=max(0, int(data.get("rounding_px", 120))),
         start_frame=int(data.get("start_frame", 0)),
         end_frame=int(data.get("end_frame", 120)),
         label=str(data.get("label") or ""),
         show_in_legend=bool(data.get("show_in_legend", True)),
+        draw_mode=str(data.get("draw_mode") or "colored").strip().lower() or "colored",
         visible=bool(data.get("visible", True)),
         points=_coerce_points(data.get("points", [])),
+        keyframes=keyframes,
     )
 
 
@@ -318,6 +340,37 @@ def project_time_label(project: Project, frame_index: int) -> str:
     return format_project_year(interpolate_project_year(project, current_frame))
 
 
+def route_layer_progress_at_frame(layer: RouteLayer, frame_index: int) -> float:
+    current_frame = int(frame_index)
+    keyframes = sorted(layer.keyframes, key=lambda item: int(item.frame))
+    if not keyframes:
+        if int(layer.end_frame) <= int(layer.start_frame):
+            return 1.0 if current_frame >= int(layer.end_frame) else 0.0
+        progress = (current_frame - int(layer.start_frame)) / float(int(layer.end_frame) - int(layer.start_frame))
+        return max(0.0, min(1.0, progress))
+
+    if current_frame <= int(keyframes[0].frame):
+        return max(0.0, min(1.0, float(keyframes[0].progress)))
+    if current_frame >= int(keyframes[-1].frame):
+        return max(0.0, min(1.0, float(keyframes[-1].progress)))
+
+    for left, right in zip(keyframes, keyframes[1:]):
+        left_frame = int(left.frame)
+        right_frame = int(right.frame)
+        if left_frame <= current_frame <= right_frame:
+            left_progress = max(0.0, min(1.0, float(left.progress)))
+            right_progress = max(0.0, min(1.0, float(right.progress)))
+            if right_frame <= left_frame:
+                return right_progress
+            if current_frame == left_frame:
+                return left_progress
+            if current_frame == right_frame:
+                return right_progress
+            progress = (current_frame - left_frame) / float(right_frame - left_frame)
+            return left_progress + (right_progress - left_progress) * progress
+    return max(0.0, min(1.0, float(keyframes[-1].progress)))
+
+
 def text_overlay_template_at_frame(layer: TextOverlayLayer, frame_index: int) -> str:
     current_frame = int(frame_index)
     keyframes = sorted(layer.text_keyframes, key=lambda item: int(item.frame))
@@ -373,6 +426,11 @@ def project_to_dict(project: Project, project_file: str | Path | None = None) ->
         data["route_layers"],
         key=lambda item: str(item.get("name", "")).lower(),
     )
+    for route_layer in data["route_layers"]:
+        route_layer["keyframes"] = sorted(
+            route_layer.get("keyframes", route_layer.get("route_keyframes", [])),
+            key=lambda item: int(item.get("frame", 0)),
+        )
     data["text_layers"] = sorted(
         data.get("text_layers", []),
         key=lambda item: str(item.get("name", "")).lower(),
