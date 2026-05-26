@@ -107,6 +107,13 @@ class TextOverlayLayer:
     corner_radius: int = 12
     frame_start: int = 0
     frame_end: int = -1
+    text_keyframes: list["TextOverlayKeyframe"] = field(default_factory=list)
+
+
+@dataclass
+class TextOverlayKeyframe:
+    frame: int
+    template: str = ""
 
 
 @dataclass
@@ -228,6 +235,14 @@ def _route_from_dict(data: dict[str, Any]) -> RouteLayer:
 
 
 def _text_layer_from_dict(data: dict[str, Any]) -> TextOverlayLayer:
+    text_keyframes = [
+        TextOverlayKeyframe(
+            frame=int(item.get("frame", 0)),
+            template=str(item.get("template", item.get("text", "")) or ""),
+        )
+        for item in data.get("text_keyframes", [])
+    ]
+    text_keyframes.sort(key=lambda item: int(item.frame))
     return TextOverlayLayer(
         id=str(data.get("id") or _uid("text")),
         name=str(data.get("name") or "Text"),
@@ -250,6 +265,7 @@ def _text_layer_from_dict(data: dict[str, Any]) -> TextOverlayLayer:
         corner_radius=max(0, int(data.get("corner_radius", 12))),
         frame_start=int(data.get("frame_start", 0)),
         frame_end=int(data.get("frame_end", -1)),
+        text_keyframes=text_keyframes,
     )
 
 
@@ -302,6 +318,17 @@ def project_time_label(project: Project, frame_index: int) -> str:
     return format_project_year(interpolate_project_year(project, current_frame))
 
 
+def text_overlay_template_at_frame(layer: TextOverlayLayer, frame_index: int) -> str:
+    current_frame = int(frame_index)
+    keyframes = sorted(layer.text_keyframes, key=lambda item: int(item.frame))
+    active_template = str(layer.template or "")
+    for keyframe in keyframes:
+        if int(keyframe.frame) > current_frame:
+            break
+        active_template = str(keyframe.template or "")
+    return active_template
+
+
 def build_text_template_context(project: Project, frame_index: int) -> dict[str, str]:
     current_frame = int(frame_index)
     frame_max = max(0, int(project.frame_count) - 1)
@@ -350,6 +377,11 @@ def project_to_dict(project: Project, project_file: str | Path | None = None) ->
         data.get("text_layers", []),
         key=lambda item: str(item.get("name", "")).lower(),
     )
+    for text_layer in data["text_layers"]:
+        text_layer["text_keyframes"] = sorted(
+            text_layer.get("text_keyframes", []),
+            key=lambda item: int(item.get("frame", 0)),
+        )
     data["time_keyframes"] = sorted(
         data.get("time_keyframes", []),
         key=lambda item: int(item.get("frame", 0)),

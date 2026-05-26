@@ -88,6 +88,7 @@ Useful overrides:
 - Text layers use an anchor plus normalized X/Y offsets, so the same box stays in a stable corner position across 1080p, 1440p, and 4K renders.
 - Font size is defined relative to 1080p and scales automatically with output height during export.
 - The text field accepts plain text or templates with placeholders such as `{project_title}`, `{frame}`, `{frame_max}`, `{progress_pct}`, `{time_label}`, and `{year}`.
+- Each text layer can appear or disappear via `Frame Start` / `Frame End`, and can also switch to different text at exact frames with `Set Text Keyframe` inside the Text panel.
 - The separate `Time` track maps frames to years through draggable project-level time keyframes, so historical timelines can be linear, non-linear, or jumpy.
 - `Time Label` is optional and only overrides the exact keyframe where it is set; otherwise the editor formats the interpolated year automatically.
 

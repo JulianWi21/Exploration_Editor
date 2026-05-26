@@ -1,6 +1,6 @@
 import unittest
 
-from exploration_editor.model import Project, TimeKeyframe, build_text_template_context, interpolate_project_year, project_time_label, render_text_template
+from exploration_editor.model import Project, TextOverlayKeyframe, TextOverlayLayer, TimeKeyframe, build_text_template_context, interpolate_project_year, project_time_label, project_to_dict, render_text_template, text_overlay_template_at_frame
 
 
 class TextOverlayTemplateTests(unittest.TestCase):
@@ -65,6 +65,38 @@ class TextOverlayTemplateTests(unittest.TestCase):
         self.assertEqual(context["year"], "")
         self.assertEqual(context["time_label"], "")
         self.assertEqual(context["progress_pct"], "10%")
+
+    def test_text_overlay_template_at_frame_uses_latest_keyframe_override(self) -> None:
+        layer = TextOverlayLayer(
+            template="Year: {time_label}",
+            text_keyframes=[
+                TextOverlayKeyframe(frame=40, template="Migration Begins"),
+                TextOverlayKeyframe(frame=80, template="Year: {time_label}"),
+            ],
+        )
+
+        self.assertEqual(text_overlay_template_at_frame(layer, 0), "Year: {time_label}")
+        self.assertEqual(text_overlay_template_at_frame(layer, 39), "Year: {time_label}")
+        self.assertEqual(text_overlay_template_at_frame(layer, 40), "Migration Begins")
+        self.assertEqual(text_overlay_template_at_frame(layer, 70), "Migration Begins")
+        self.assertEqual(text_overlay_template_at_frame(layer, 80), "Year: {time_label}")
+
+    def test_project_to_dict_sorts_text_keyframes_per_layer(self) -> None:
+        project = Project(
+            text_layers=[
+                TextOverlayLayer(
+                    name="Overlay",
+                    text_keyframes=[
+                        TextOverlayKeyframe(frame=80, template="Late"),
+                        TextOverlayKeyframe(frame=20, template="Early"),
+                    ],
+                )
+            ]
+        )
+
+        payload = project_to_dict(project)
+
+        self.assertEqual([item["frame"] for item in payload["text_layers"][0]["text_keyframes"]], [20, 80])
 
 
 if __name__ == "__main__":

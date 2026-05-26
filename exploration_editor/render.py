@@ -9,7 +9,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from exploration_editor.basemap import load_basemap_image
 from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, path_prefix, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, route_progress, unwrap_longitudes
-from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template
+from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template, text_overlay_template_at_frame
 
 
 @dataclass(frozen=True)
@@ -406,7 +406,7 @@ def _draw_text_overlays(
         if not _text_layer_visible(layer, frame_index):
             continue
 
-        text = render_text_template(layer.template, project, frame_index).strip()
+        text = render_text_template(text_overlay_template_at_frame(layer, frame_index), project, frame_index).strip()
         if not text:
             continue
 

@@ -54,6 +54,7 @@ from exploration_editor.model import (
     PolygonLayer,
     Project,
     RouteLayer,
+    TextOverlayKeyframe,
     TextOverlayLayer,
     TimeKeyframe,
     default_project,
@@ -61,6 +62,7 @@ from exploration_editor.model import (
     load_project,
     project_time_label,
     save_project,
+    text_overlay_template_at_frame,
 )
 from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
 from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame, render_frame
@@ -1211,9 +1213,21 @@ class MainWindow(QMainWindow):
         self.text_props_group = QGroupBox("Text")
         text_form = QFormLayout(self.text_props_group)
         text_form.setContentsMargins(10, 12, 10, 10)
+        self.text_keyframe_status_label = QLabel("Default text used for this layer.")
+        self.text_keyframe_status_label.setWordWrap(True)
         self.text_template_edit = QPlainTextEdit()
         self.text_template_edit.setPlaceholderText("Text or template, e.g. Year: {time_label}")
         self.text_template_edit.setFixedHeight(72)
+        self.set_text_keyframe_button = QPushButton("Set Text Keyframe")
+        self.set_text_keyframe_button.setToolTip("Create or update a frame-specific text override for the current timeline position.")
+        self.delete_text_keyframe_button = QPushButton("Delete Text Keyframe")
+        self.delete_text_keyframe_button.setToolTip("Remove the text override that exists exactly at the current frame.")
+        text_keyframe_buttons = QWidget()
+        text_keyframe_buttons_layout = QHBoxLayout(text_keyframe_buttons)
+        text_keyframe_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        text_keyframe_buttons_layout.setSpacing(6)
+        text_keyframe_buttons_layout.addWidget(self.set_text_keyframe_button)
+        text_keyframe_buttons_layout.addWidget(self.delete_text_keyframe_button)
         self.text_opacity_spin = QDoubleSpinBox()
         self.text_opacity_spin.setRange(0.05, 1.0)
         self.text_opacity_spin.setSingleStep(0.05)
@@ -1258,7 +1272,9 @@ class MainWindow(QMainWindow):
         self.text_frame_end_spin.setRange(-1, 999999)
         self.text_frame_end_spin.setSpecialValueText("Project End")
         text_form.addRow("Opacity", self.text_opacity_spin)
+        text_form.addRow("Text Scope", self.text_keyframe_status_label)
         text_form.addRow("Text / Template", self.text_template_edit)
+        text_form.addRow("Keyframe", text_keyframe_buttons)
         text_form.addRow("Text Anchor", self.text_anchor_combo)
         text_form.addRow("Text Align", self.text_align_combo)
         text_form.addRow("Font Size", self.text_font_size_spin)
@@ -1364,6 +1380,8 @@ class MainWindow(QMainWindow):
         self.route_label_edit.editingFinished.connect(self._apply_layer_form)
         self.route_legend_check.stateChanged.connect(self._apply_layer_form)
         self.text_template_edit.textChanged.connect(self._apply_layer_form)
+        self.set_text_keyframe_button.clicked.connect(self._set_text_keyframe)
+        self.delete_text_keyframe_button.clicked.connect(self._delete_text_keyframe)
         self.text_opacity_spin.valueChanged.connect(self._apply_layer_form)
         self.text_anchor_combo.currentIndexChanged.connect(self._apply_layer_form)
         self.text_align_combo.currentIndexChanged.connect(self._apply_layer_form)
@@ -1659,6 +1677,33 @@ class MainWindow(QMainWindow):
         self.delete_time_keyframe_button.setEnabled(exact_keyframe is not None)
         self._updating_form = False
 
+    def _selected_text_keyframe_at_current_frame(self, layer: TextOverlayLayer) -> TextOverlayKeyframe | None:
+        current_frame = int(self.timeline_slider.value())
+        for keyframe in sorted(layer.text_keyframes, key=lambda item: int(item.frame)):
+            if int(keyframe.frame) == current_frame:
+                return keyframe
+        return None
+
+    def _populate_text_form(self, layer: TextOverlayLayer) -> None:
+        current_frame = int(self.timeline_slider.value())
+        exact_keyframe = self._selected_text_keyframe_at_current_frame(layer)
+        active_template = text_overlay_template_at_frame(layer, current_frame)
+
+        self.text_template_edit.setPlainText(exact_keyframe.template if exact_keyframe is not None else layer.template)
+        if exact_keyframe is not None:
+            status = f"Editing text keyframe at frame {current_frame}."
+        elif layer.text_keyframes and active_template != layer.template:
+            status = "Editing default text. An earlier text keyframe is currently overriding the preview."
+        elif layer.text_keyframes:
+            status = "Editing default text. Use Set Text Keyframe to override it at later frames."
+        else:
+            status = "Editing default text for this layer."
+
+        self.text_keyframe_status_label.setText(status)
+        self.text_template_edit.setPlaceholderText("Text or template, e.g. Year: {time_label}")
+        self.set_text_keyframe_button.setText("Update Text Keyframe" if exact_keyframe is not None else "Set Text Keyframe")
+        self.delete_text_keyframe_button.setEnabled(exact_keyframe is not None)
+
     def _apply_time_keyframe_form(self) -> None:
         if self._updating_form:
             return
@@ -1716,7 +1761,11 @@ class MainWindow(QMainWindow):
             self.layer_visible_check.setChecked(False)
             self._set_color_button([255, 255, 255])
             self.polygon_opacity_spin.setValue(1.0)
+            self.text_keyframe_status_label.setText("Default text used for this layer.")
             self.text_template_edit.setPlainText("")
+            self.set_text_keyframe_button.setText("Set Text Keyframe")
+            self.set_text_keyframe_button.setEnabled(False)
+            self.delete_text_keyframe_button.setEnabled(False)
             self.text_opacity_spin.setValue(1.0)
             self.text_anchor_combo.setCurrentIndex(max(0, self.text_anchor_combo.findData("top_right")))
             self.text_align_combo.setCurrentIndex(max(0, self.text_align_combo.findData("right")))
@@ -1761,7 +1810,8 @@ class MainWindow(QMainWindow):
             self._populate_polygon_easing_form(None, None, False)
         else:
             self.text_opacity_spin.setValue(layer.opacity)
-            self.text_template_edit.setPlainText(layer.template)
+            self.set_text_keyframe_button.setEnabled(True)
+            self._populate_text_form(layer)
             self.text_font_size_spin.setValue(layer.font_size)
             self.text_offset_x_spin.setValue(float(layer.offset_x) * 100.0)
             self.text_offset_y_spin.setValue(float(layer.offset_y) * 100.0)
@@ -1892,7 +1942,12 @@ class MainWindow(QMainWindow):
             layer.show_in_legend = self.route_legend_check.isChecked()
         else:
             layer.opacity = float(self.text_opacity_spin.value())
-            layer.template = self.text_template_edit.toPlainText().strip()
+            exact_keyframe = self._selected_text_keyframe_at_current_frame(layer)
+            target_template = self.text_template_edit.toPlainText().strip()
+            if exact_keyframe is None:
+                layer.template = target_template
+            else:
+                exact_keyframe.template = target_template
             layer.anchor = str(self.text_anchor_combo.currentData() or "top_right")
             layer.alignment = str(self.text_align_combo.currentData() or "right")
             layer.font_size = int(self.text_font_size_spin.value())
@@ -1985,6 +2040,40 @@ class MainWindow(QMainWindow):
         self._populate_layer_form()
         self._refresh_canvas_only()
         self.statusBar().showMessage(f"Text layer created: {layer.name}", 2500)
+
+    def _set_text_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            QMessageBox.information(self, "Text Keyframe", "Select a text layer first.")
+            return
+
+        current_frame = int(self.timeline_slider.value())
+        keyframe = self._selected_text_keyframe_at_current_frame(layer)
+        if keyframe is None:
+            keyframe = TextOverlayKeyframe(frame=current_frame, template=layer.template)
+            layer.text_keyframes.append(keyframe)
+
+        layer.text_keyframes.sort(key=lambda item: int(item.frame))
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Text keyframe set at frame {current_frame}", 2500)
+
+    def _delete_text_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            QMessageBox.information(self, "Delete Text Keyframe", "Select a text layer first.")
+            return
+
+        current_frame = int(self.timeline_slider.value())
+        existing = self._selected_text_keyframe_at_current_frame(layer)
+        if existing is None:
+            QMessageBox.information(self, "Delete Text Keyframe", f"No text keyframe at frame {current_frame}.")
+            return
+
+        layer.text_keyframes = [item for item in layer.text_keyframes if int(item.frame) != current_frame]
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Text keyframe deleted at frame {current_frame}", 2500)
 
     def _insert_current_keyframe(self) -> None:
         kind, layer = self._selected_layer()

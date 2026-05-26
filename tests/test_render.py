@@ -2,7 +2,7 @@ import unittest
 
 from PIL import Image
 
-from exploration_editor.model import PolygonKeyframe, PolygonLayer, ViewState
+from exploration_editor.model import PolygonKeyframe, PolygonLayer, TextOverlayKeyframe, ViewState
 from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame
 from exploration_editor.model import Project, TextOverlayLayer
 from exploration_editor.render import render_frame
@@ -137,6 +137,35 @@ class RenderViewTests(unittest.TestCase):
         hidden = render_frame(project, basemap_image=basemap, frame_index=5, output_size=(320, 180), preview=True)
 
         self.assertNotEqual(list(visible.getdata()), list(hidden.getdata()))
+
+    def test_render_frame_uses_text_keyframes_for_content_switches(self) -> None:
+        project = Project(
+            width=320,
+            height=180,
+            fog_opacity=0.0,
+            text_layers=[
+                TextOverlayLayer(
+                    name="Label",
+                    template="EARLY",
+                    anchor="top_left",
+                    offset_x=0.05,
+                    offset_y=0.05,
+                    color=[0, 0, 0],
+                    background_color=[255, 0, 0],
+                    background_opacity=1.0,
+                    border_opacity=0.0,
+                    text_keyframes=[
+                        TextOverlayKeyframe(frame=10, template="LATE STAGE"),
+                    ],
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (320, 180), (230, 230, 230))
+
+        early = render_frame(project, basemap_image=basemap, frame_index=0, output_size=(320, 180), preview=True)
+        late = render_frame(project, basemap_image=basemap, frame_index=10, output_size=(320, 180), preview=True)
+
+        self.assertNotEqual(list(early.getdata()), list(late.getdata()))
 
 
 if __name__ == "__main__":
