@@ -9,7 +9,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from exploration_editor.basemap import load_basemap_image
 from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, path_prefix, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, route_progress, unwrap_longitudes
-from exploration_editor.model import PolygonLayer, Project, RouteLayer, ViewState
+from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,19 @@ class PreparedFrameRender:
     layout: dict[str, float]
     background_array: np.ndarray
     map_alpha: np.ndarray
+
+
+_TEXT_ANCHOR_RATIOS = {
+    "top_left": (0.0, 0.0),
+    "top_center": (0.5, 0.0),
+    "top_right": (1.0, 0.0),
+    "center_left": (0.0, 0.5),
+    "center": (0.5, 0.5),
+    "center_right": (1.0, 0.5),
+    "bottom_left": (0.0, 1.0),
+    "bottom_center": (0.5, 1.0),
+    "bottom_right": (1.0, 1.0),
+}
 
 
 def clamp_view_state(
@@ -344,6 +357,104 @@ def _load_font(font_path: str | Path | None, size: int) -> ImageFont.FreeTypeFon
     return _load_font_cached(font_key, int(size))
 
 
+def _scale_frame_value(value: float | int, scale: float, minimum: int = 0) -> int:
+    return max(int(minimum), int(round(float(value) * float(scale))))
+
+
+def _layer_rgba(color: list[int], alpha: float) -> tuple[int, int, int, int]:
+    return tuple(int(v) for v in color[:3]) + (max(0, min(255, int(round(max(0.0, min(1.0, alpha)) * 255.0)))),)
+
+
+def _text_layer_visible(layer: TextOverlayLayer, frame_index: int) -> bool:
+    if not layer.visible or layer.opacity <= 0.0:
+        return False
+    if int(frame_index) < int(layer.frame_start):
+        return False
+    if int(layer.frame_end) >= 0 and int(frame_index) > int(layer.frame_end):
+        return False
+    return True
+
+
+def _text_panel_origin(
+    layer: TextOverlayLayer,
+    frame_size: tuple[int, int],
+    panel_size: tuple[int, int],
+) -> tuple[float, float]:
+    frame_w, frame_h = frame_size
+    panel_w, panel_h = panel_size
+    ratio_x, ratio_y = _TEXT_ANCHOR_RATIOS.get(str(layer.anchor), (1.0, 0.0))
+    anchor_x = ratio_x * frame_w + float(layer.offset_x) * frame_w
+    anchor_y = ratio_y * frame_h + float(layer.offset_y) * frame_h
+    return anchor_x - panel_w * ratio_x, anchor_y - panel_h * ratio_y
+
+
+def _draw_text_overlays(
+    frame_img: Image.Image,
+    project: Project,
+    frame_index: int,
+    font_path: str | Path | None,
+) -> None:
+    if not project.text_layers:
+        return
+
+    frame_w, frame_h = frame_img.size
+    scale = frame_h / 1080.0
+    overlay = Image.new("RGBA", frame_img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    for layer in project.text_layers:
+        if not _text_layer_visible(layer, frame_index):
+            continue
+
+        text = render_text_template(layer.template, project, frame_index).strip()
+        if not text:
+            continue
+
+        font = _load_font(font_path, max(1, _scale_frame_value(layer.font_size, scale, minimum=1)))
+        spacing = max(0, _scale_frame_value(6, scale))
+        text_box = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=layer.alignment)
+        text_w = max(0, int(round(text_box[2] - text_box[0])))
+        text_h = max(0, int(round(text_box[3] - text_box[1])))
+        pad_x = _scale_frame_value(layer.padding_x, scale)
+        pad_y = _scale_frame_value(layer.padding_y, scale)
+        panel_w = text_w + pad_x * 2
+        panel_h = text_h + pad_y * 2
+        panel_x, panel_y = _text_panel_origin(layer, (frame_w, frame_h), (panel_w, panel_h))
+        panel_rect = [panel_x, panel_y, panel_x + panel_w, panel_y + panel_h]
+
+        background_alpha = float(layer.opacity) * float(layer.background_opacity)
+        if background_alpha > 0.0:
+            draw.rounded_rectangle(
+                panel_rect,
+                radius=max(0, _scale_frame_value(layer.corner_radius, scale)),
+                fill=_layer_rgba(layer.background_color, background_alpha),
+            )
+
+        border_width = _scale_frame_value(layer.border_width, scale)
+        border_alpha = float(layer.opacity) * float(layer.border_opacity)
+        if border_width > 0 and border_alpha > 0.0:
+            draw.rounded_rectangle(
+                panel_rect,
+                radius=max(0, _scale_frame_value(layer.corner_radius, scale)),
+                outline=_layer_rgba(layer.border_color, border_alpha),
+                width=border_width,
+            )
+
+        text_x = panel_x + pad_x - float(text_box[0])
+        text_y = panel_y + pad_y - float(text_box[1])
+        draw.multiline_text(
+            (text_x, text_y),
+            text,
+            font=font,
+            fill=_layer_rgba(layer.color, float(layer.opacity)),
+            spacing=spacing,
+            align=layer.alignment,
+        )
+
+    composed = Image.alpha_composite(frame_img.convert("RGBA"), overlay)
+    frame_img.paste(composed.convert("RGB"), (0, 0))
+
+
 def prepare_frame_render(
     project: Project,
     basemap_image: Image.Image | None = None,
@@ -506,4 +617,5 @@ def render_frame(
 
     _draw_routes(frame_img, project, frame_index, layout)
     _draw_legend(frame_img, project, frame_index, font_path)
+    _draw_text_overlays(frame_img, project, frame_index, font_path)
     return frame_img

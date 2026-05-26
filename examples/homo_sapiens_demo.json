@@ -98,5 +98,52 @@
       ]
     }
   ],
-  "route_layers": []
+  "route_layers": [],
+  "text_layers": [
+    {
+      "name": "Year",
+      "template": "Year: {time_label}",
+      "color": [247, 250, 252],
+      "visible": true,
+      "opacity": 1.0,
+      "anchor": "top_right",
+      "offset_x": -0.03,
+      "offset_y": 0.03,
+      "alignment": "right",
+      "font_size": 54,
+      "padding_x": 18,
+      "padding_y": 12,
+      "background_color": [11, 15, 21],
+      "background_opacity": 0.72,
+      "border_color": [225, 232, 242],
+      "border_opacity": 0.24,
+      "border_width": 1,
+      "corner_radius": 12,
+      "frame_start": 0,
+      "frame_end": -1
+    }
+  ],
+  "time_keyframes": [
+    {
+      "frame": 0,
+      "year": -200000
+    },
+    {
+      "frame": 110,
+      "year": -100000
+    },
+    {
+      "frame": 230,
+      "year": -60000
+    },
+    {
+      "frame": 360,
+      "year": -15000
+    },
+    {
+      "frame": 479,
+      "year": 2026,
+      "label": "Present Day"
+    }
+  ]
 }

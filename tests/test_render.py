@@ -1,7 +1,11 @@
 import unittest
 
+from PIL import Image
+
 from exploration_editor.model import PolygonKeyframe, PolygonLayer, ViewState
 from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame
+from exploration_editor.model import Project, TextOverlayLayer
+from exploration_editor.render import render_frame
 
 
 class RenderViewTests(unittest.TestCase):
@@ -68,6 +72,71 @@ class RenderViewTests(unittest.TestCase):
         halfway_path = polygon_outline_screen_paths_at_frame(layer, 50, layout)[1]
 
         self.assertAlmostEqual(max(point[0] for point in halfway_path), max(point[0] for point in exact_path), delta=1.0)
+
+    def test_render_frame_draws_text_overlay_in_expected_corner(self) -> None:
+        project = Project(
+            width=400,
+            height=200,
+            fog_opacity=0.0,
+            text_layers=[
+                TextOverlayLayer(
+                    name="Year",
+                    template="Year {time_label}",
+                    anchor="top_right",
+                    offset_x=-0.05,
+                    offset_y=0.05,
+                    alignment="right",
+                    color=[0, 0, 0],
+                    background_color=[255, 0, 0],
+                    background_opacity=1.0,
+                    border_opacity=0.0,
+                    font_size=44,
+                    padding_x=12,
+                    padding_y=8,
+                    frame_start=0,
+                    frame_end=5,
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (400, 200), (230, 230, 230))
+
+        image = render_frame(project, basemap_image=basemap, frame_index=0, output_size=(400, 200), preview=True)
+        pixels = image.load()
+        red_pixels = 0
+        for x in range(220, 390):
+            for y in range(0, 90):
+                if pixels[x, y][0] > 230 and pixels[x, y][1] < 80 and pixels[x, y][2] < 80:
+                    red_pixels += 1
+
+        self.assertGreater(red_pixels, 200)
+
+    def test_render_frame_hides_text_overlay_outside_frame_range(self) -> None:
+        project = Project(
+            width=320,
+            height=180,
+            fog_opacity=0.0,
+            text_layers=[
+                TextOverlayLayer(
+                    name="Year",
+                    template="Overlay",
+                    anchor="top_left",
+                    offset_x=0.05,
+                    offset_y=0.05,
+                    color=[0, 0, 0],
+                    background_color=[255, 0, 0],
+                    background_opacity=1.0,
+                    border_opacity=0.0,
+                    frame_start=10,
+                    frame_end=20,
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (320, 180), (230, 230, 230))
+
+        visible = render_frame(project, basemap_image=basemap, frame_index=10, output_size=(320, 180), preview=True)
+        hidden = render_frame(project, basemap_image=basemap, frame_index=5, output_size=(320, 180), preview=True)
+
+        self.assertNotEqual(list(visible.getdata()), list(hidden.getdata()))
 
 
 if __name__ == "__main__":

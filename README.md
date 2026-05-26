@@ -11,6 +11,8 @@ The repo is intentionally separate from RisingSeaLevel and Tsunami. It reuses on
 - Draw reveal polygons on a world map
 - Add polygon keyframes and interpolate between them
 - Draw expedition routes and animate path progress
+- Add anchored text overlays with template placeholders
+- Map frames to years with a separate global time track
 - Dark fog-of-war overlay with feathered reveal masks
 - Legend for active routes
 - PNG export
@@ -80,10 +82,20 @@ Useful overrides:
 - `--duration` -> temporary duration override for short test renders
 - `--output` -> custom MP4 output path
 
+## Text Overlays And Time Track
+
+- Create `Text` layers from the toolbar to render labels, captions, year stamps, or other HUD boxes.
+- Text layers use an anchor plus normalized X/Y offsets, so the same box stays in a stable corner position across 1080p, 1440p, and 4K renders.
+- Font size is defined relative to 1080p and scales automatically with output height during export.
+- The text field accepts plain text or templates with placeholders such as `{project_title}`, `{frame}`, `{frame_max}`, `{progress_pct}`, `{time_label}`, and `{year}`.
+- The separate `Time` track maps frames to years through draggable project-level time keyframes, so historical timelines can be linear, non-linear, or jumpy.
+- `Time Label` is optional and only overrides the exact keyframe where it is set; otherwise the editor formats the interpolated year automatically.
+
 ## Notes
 
 - This MVP uses a clean headless renderer plus a thin PyQt6 editor.
 - Route labels are currently handled as a legend, not text-on-path.
+- Text overlays currently move via the layer form and normalized offsets; direct drag-on-canvas editing is not implemented yet.
 - Polygon interpolation keeps matched vertices stable across keyframes and only inserts proxy points locally when topology changes.
 - Polygon keyframes can now retime their outgoing segment with Linear, Ease In, Ease Out, or Ease In-Out timing curves from the editor.
 - Polygon keyframes can optionally equalize revealed area over time with the Constant Area checkbox on the outgoing segment.

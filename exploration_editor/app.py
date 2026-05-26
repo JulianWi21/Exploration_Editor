@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,11 +25,14 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -50,8 +54,12 @@ from exploration_editor.model import (
     PolygonLayer,
     Project,
     RouteLayer,
+    TextOverlayLayer,
+    TimeKeyframe,
     default_project,
+    interpolate_project_year,
     load_project,
+    project_time_label,
     save_project,
 )
 from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
@@ -81,6 +89,22 @@ POLYGON_EASING_OPTIONS = [
     ("Ease In", "ease_in"),
     ("Ease Out", "ease_out"),
     ("Ease In-Out", "ease_in_out"),
+]
+TEXT_ANCHOR_OPTIONS = [
+    ("Top Left", "top_left"),
+    ("Top Center", "top_center"),
+    ("Top Right", "top_right"),
+    ("Center Left", "center_left"),
+    ("Center", "center"),
+    ("Center Right", "center_right"),
+    ("Bottom Left", "bottom_left"),
+    ("Bottom Center", "bottom_center"),
+    ("Bottom Right", "bottom_right"),
+]
+TEXT_ALIGN_OPTIONS = [
+    ("Left", "left"),
+    ("Center", "center"),
+    ("Right", "right"),
 ]
 
 
@@ -987,6 +1011,7 @@ class MainWindow(QMainWindow):
         self.delete_keyframe_button = QPushButton("Delete Keyframe")
         self.delete_keyframe_button.setToolTip("Delete the keyframe that is exactly at the current frame.")
         self.new_route_button = QPushButton("New Route")
+        self.new_text_button = QPushButton("New Text")
         self.delete_layer_button = QPushButton("Delete Layer")
         self.export_png_button = QPushButton("Export PNG")
         self.export_video_button = QPushButton("Export MP4")
@@ -1000,12 +1025,6 @@ class MainWindow(QMainWindow):
             self.save_project_button,
             self.save_project_as_button,
             self.open_basemap_button,
-            self.new_polygon_button,
-            self.add_keyframe_button,
-            self.insert_keyframe_button,
-            self.delete_keyframe_button,
-            self.new_route_button,
-            self.delete_layer_button,
             self.export_png_button,
             self.export_video_button,
             self.play_button,
@@ -1024,9 +1043,17 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(10)
 
-        project_box = QWidget()
-        project_form = QFormLayout(project_box)
-        project_form.setContentsMargins(0, 0, 0, 0)
+        self.sidebar_tabs = QTabWidget()
+        side_layout.addWidget(self.sidebar_tabs, 1)
+
+        self.project_tab = QWidget()
+        project_tab_layout = QVBoxLayout(self.project_tab)
+        project_tab_layout.setContentsMargins(0, 0, 0, 0)
+        project_tab_layout.setSpacing(10)
+
+        project_group = QGroupBox("Project")
+        project_form = QFormLayout(project_group)
+        project_form.setContentsMargins(10, 12, 10, 10)
         self.title_edit = QLineEdit()
         self.duration_spin = QDoubleSpinBox()
         self.duration_spin.setRange(2.0, 300.0)
@@ -1038,31 +1065,117 @@ class MainWindow(QMainWindow):
         self.fog_spin.setSingleStep(0.02)
         self.video_format_combo = QComboBox()
         self.basemap_combo = QComboBox()
+        self.time_year_spin = QDoubleSpinBox()
+        self.time_year_spin.setRange(-1000000.0, 1000000.0)
+        self.time_year_spin.setDecimals(0)
+        self.time_year_spin.setSingleStep(100.0)
+        self.time_year_spin.setToolTip("Interpolated or exact project year at the current frame. Use Set Time Keyframe to store it on the global time track.")
+        self.time_label_edit = QLineEdit()
+        self.time_label_edit.setPlaceholderText("Optional exact-frame label, e.g. Present Day")
+        self.set_time_keyframe_button = QPushButton("Set Time Keyframe")
+        self.delete_time_keyframe_button = QPushButton("Delete Time Keyframe")
         project_form.addRow("Title", self.title_edit)
         project_form.addRow("Duration", self.duration_spin)
         project_form.addRow("FPS", self.fps_spin)
         project_form.addRow("Fog Opacity", self.fog_spin)
         project_form.addRow("Video Format", self.video_format_combo)
         project_form.addRow("Basemap", self.basemap_combo)
-        side_layout.addWidget(project_box)
 
-        side_layout.addWidget(QLabel("Layers"))
+        time_group = QGroupBox("Time Track")
+        time_form = QFormLayout(time_group)
+        time_form.setContentsMargins(10, 12, 10, 10)
+        time_buttons = QWidget()
+        time_buttons_layout = QHBoxLayout(time_buttons)
+        time_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        time_buttons_layout.setSpacing(6)
+        time_buttons_layout.addWidget(self.set_time_keyframe_button)
+        time_buttons_layout.addWidget(self.delete_time_keyframe_button)
+        time_form.addRow("Year", self.time_year_spin)
+        time_form.addRow("Label", self.time_label_edit)
+        time_form.addRow("Keyframe", time_buttons)
+
+        project_tab_layout.addWidget(project_group)
+        project_tab_layout.addWidget(time_group)
+        project_tab_layout.addStretch(1)
+        self.sidebar_tabs.addTab(self.project_tab, "Project")
+
+        self.layers_tab = QWidget()
+        layers_tab_layout = QVBoxLayout(self.layers_tab)
+        layers_tab_layout.setContentsMargins(0, 0, 0, 0)
+        layers_tab_layout.setSpacing(10)
+
+        layer_actions_row1 = QHBoxLayout()
+        layer_actions_row1.setContentsMargins(0, 0, 0, 0)
+        layer_actions_row1.setSpacing(6)
+        for button in [
+            self.new_polygon_button,
+            self.add_keyframe_button,
+            self.insert_keyframe_button,
+        ]:
+            layer_actions_row1.addWidget(button)
+
+        layer_actions_row2 = QHBoxLayout()
+        layer_actions_row2.setContentsMargins(0, 0, 0, 0)
+        layer_actions_row2.setSpacing(6)
+        for button in [
+            self.delete_keyframe_button,
+            self.new_route_button,
+            self.new_text_button,
+            self.delete_layer_button,
+        ]:
+            layer_actions_row2.addWidget(button)
+
+        layer_actions = QWidget()
+        layer_actions_layout = QVBoxLayout(layer_actions)
+        layer_actions_layout.setContentsMargins(0, 0, 0, 0)
+        layer_actions_layout.setSpacing(6)
+        layer_actions_layout.addLayout(layer_actions_row1)
+        layer_actions_layout.addLayout(layer_actions_row2)
+        layers_tab_layout.addWidget(layer_actions)
+
+        layer_list_group = QGroupBox("Layers")
+        layer_list_layout = QVBoxLayout(layer_list_group)
+        layer_list_layout.setContentsMargins(10, 12, 10, 10)
         self.layer_list = QListWidget()
-        side_layout.addWidget(self.layer_list, 1)
+        self.layer_list.setMinimumHeight(180)
+        layer_list_layout.addWidget(self.layer_list)
+        layers_tab_layout.addWidget(layer_list_group, 1)
 
-        props_box = QWidget()
-        props_form = QFormLayout(props_box)
-        props_form.setContentsMargins(0, 0, 0, 0)
+        selection_group = QGroupBox("Selected Layer")
+        selection_group_layout = QVBoxLayout(selection_group)
+        selection_group_layout.setContentsMargins(10, 12, 10, 10)
+        selection_group_layout.setSpacing(8)
+        self.no_selection_label = QLabel("Select a layer to edit its properties.")
+        self.no_selection_label.setWordWrap(True)
+        selection_group_layout.addWidget(self.no_selection_label)
+
+        self.properties_scroll = QScrollArea()
+        self.properties_scroll.setWidgetResizable(True)
+        props_container = QWidget()
+        props_container_layout = QVBoxLayout(props_container)
+        props_container_layout.setContentsMargins(0, 0, 0, 0)
+        props_container_layout.setSpacing(10)
+
+        self.common_props_group = QGroupBox("Layer")
+        common_form = QFormLayout(self.common_props_group)
+        common_form.setContentsMargins(10, 12, 10, 10)
         self.layer_name_edit = QLineEdit()
         self.layer_visible_check = QCheckBox()
         self.color_button = QPushButton("Pick Color")
+        common_form.addRow("Layer Name", self.layer_name_edit)
+        common_form.addRow("Visible", self.layer_visible_check)
+        common_form.addRow("Color", self.color_button)
+
+        self.polygon_props_group = QGroupBox("Polygon")
+        polygon_form = QFormLayout(self.polygon_props_group)
+        polygon_form.setContentsMargins(10, 12, 10, 10)
         self.feather_spin = QSpinBox()
         self.feather_spin.setRange(0, 240)
         self.rounding_spin = QSpinBox()
         self.rounding_spin.setRange(0, 240)
-        self.opacity_spin = QDoubleSpinBox()
-        self.opacity_spin.setRange(0.05, 1.0)
-        self.opacity_spin.setSingleStep(0.05)
+        self.polygon_opacity_spin = QDoubleSpinBox()
+        self.polygon_opacity_spin.setRange(0.05, 1.0)
+        self.polygon_opacity_spin.setSingleStep(0.05)
         self.polygon_constant_area_check = QCheckBox()
         self.polygon_constant_area_check.setToolTip(
             "Equalize discovered polygon area across time for the segment from the current exact keyframe to the next one."
@@ -1071,6 +1184,15 @@ class MainWindow(QMainWindow):
         for label, value in POLYGON_EASING_OPTIONS:
             self.polygon_easing_combo.addItem(label, value)
         self.polygon_easing_combo.setToolTip("Controls the timing curve from the exact polygon keyframe at the current frame to the next polygon keyframe.")
+        polygon_form.addRow("Feather", self.feather_spin)
+        polygon_form.addRow("Rounding", self.rounding_spin)
+        polygon_form.addRow("Opacity", self.polygon_opacity_spin)
+        polygon_form.addRow("Constant Area", self.polygon_constant_area_check)
+        polygon_form.addRow("Next Segment", self.polygon_easing_combo)
+
+        self.route_props_group = QGroupBox("Route")
+        route_form = QFormLayout(self.route_props_group)
+        route_form.setContentsMargins(10, 12, 10, 10)
         self.route_width_spin = QSpinBox()
         self.route_width_spin.setRange(1, 60)
         self.route_reveal_spin = QSpinBox()
@@ -1079,21 +1201,90 @@ class MainWindow(QMainWindow):
         self.route_end_spin = QSpinBox()
         self.route_label_edit = QLineEdit()
         self.route_legend_check = QCheckBox()
-        props_form.addRow("Layer Name", self.layer_name_edit)
-        props_form.addRow("Visible", self.layer_visible_check)
-        props_form.addRow("Color", self.color_button)
-        props_form.addRow("Feather", self.feather_spin)
-        props_form.addRow("Rounding", self.rounding_spin)
-        props_form.addRow("Opacity", self.opacity_spin)
-        props_form.addRow("Constant Area", self.polygon_constant_area_check)
-        props_form.addRow("Next Segment", self.polygon_easing_combo)
-        props_form.addRow("Route Width", self.route_width_spin)
-        props_form.addRow("Reveal Width", self.route_reveal_spin)
-        props_form.addRow("Start Frame", self.route_start_spin)
-        props_form.addRow("End Frame", self.route_end_spin)
-        props_form.addRow("Legend Label", self.route_label_edit)
-        props_form.addRow("Show Legend", self.route_legend_check)
-        side_layout.addWidget(props_box)
+        route_form.addRow("Route Width", self.route_width_spin)
+        route_form.addRow("Reveal Width", self.route_reveal_spin)
+        route_form.addRow("Start Frame", self.route_start_spin)
+        route_form.addRow("End Frame", self.route_end_spin)
+        route_form.addRow("Legend Label", self.route_label_edit)
+        route_form.addRow("Show Legend", self.route_legend_check)
+
+        self.text_props_group = QGroupBox("Text")
+        text_form = QFormLayout(self.text_props_group)
+        text_form.setContentsMargins(10, 12, 10, 10)
+        self.text_template_edit = QPlainTextEdit()
+        self.text_template_edit.setPlaceholderText("Text or template, e.g. Year: {time_label}")
+        self.text_template_edit.setFixedHeight(72)
+        self.text_opacity_spin = QDoubleSpinBox()
+        self.text_opacity_spin.setRange(0.05, 1.0)
+        self.text_opacity_spin.setSingleStep(0.05)
+        self.text_anchor_combo = QComboBox()
+        for label, value in TEXT_ANCHOR_OPTIONS:
+            self.text_anchor_combo.addItem(label, value)
+        self.text_align_combo = QComboBox()
+        for label, value in TEXT_ALIGN_OPTIONS:
+            self.text_align_combo.addItem(label, value)
+        self.text_font_size_spin = QSpinBox()
+        self.text_font_size_spin.setRange(8, 240)
+        self.text_font_size_spin.setToolTip("Base font size at 1080p. The renderer scales it with frame height.")
+        self.text_offset_x_spin = QDoubleSpinBox()
+        self.text_offset_x_spin.setRange(-100.0, 100.0)
+        self.text_offset_x_spin.setDecimals(1)
+        self.text_offset_x_spin.setSingleStep(1.0)
+        self.text_offset_x_spin.setSuffix(" %")
+        self.text_offset_y_spin = QDoubleSpinBox()
+        self.text_offset_y_spin.setRange(-100.0, 100.0)
+        self.text_offset_y_spin.setDecimals(1)
+        self.text_offset_y_spin.setSingleStep(1.0)
+        self.text_offset_y_spin.setSuffix(" %")
+        self.text_padding_x_spin = QSpinBox()
+        self.text_padding_x_spin.setRange(0, 200)
+        self.text_padding_y_spin = QSpinBox()
+        self.text_padding_y_spin.setRange(0, 200)
+        self.text_background_color_button = QPushButton("Pick Background")
+        self.text_background_opacity_spin = QDoubleSpinBox()
+        self.text_background_opacity_spin.setRange(0.0, 1.0)
+        self.text_background_opacity_spin.setSingleStep(0.05)
+        self.text_border_color_button = QPushButton("Pick Border")
+        self.text_border_opacity_spin = QDoubleSpinBox()
+        self.text_border_opacity_spin.setRange(0.0, 1.0)
+        self.text_border_opacity_spin.setSingleStep(0.05)
+        self.text_border_width_spin = QSpinBox()
+        self.text_border_width_spin.setRange(0, 24)
+        self.text_corner_radius_spin = QSpinBox()
+        self.text_corner_radius_spin.setRange(0, 120)
+        self.text_frame_start_spin = QSpinBox()
+        self.text_frame_start_spin.setRange(0, 999999)
+        self.text_frame_end_spin = QSpinBox()
+        self.text_frame_end_spin.setRange(-1, 999999)
+        self.text_frame_end_spin.setSpecialValueText("Project End")
+        text_form.addRow("Opacity", self.text_opacity_spin)
+        text_form.addRow("Text / Template", self.text_template_edit)
+        text_form.addRow("Text Anchor", self.text_anchor_combo)
+        text_form.addRow("Text Align", self.text_align_combo)
+        text_form.addRow("Font Size", self.text_font_size_spin)
+        text_form.addRow("Offset X", self.text_offset_x_spin)
+        text_form.addRow("Offset Y", self.text_offset_y_spin)
+        text_form.addRow("Padding X", self.text_padding_x_spin)
+        text_form.addRow("Padding Y", self.text_padding_y_spin)
+        text_form.addRow("BG Color", self.text_background_color_button)
+        text_form.addRow("BG Opacity", self.text_background_opacity_spin)
+        text_form.addRow("Border Color", self.text_border_color_button)
+        text_form.addRow("Border Opacity", self.text_border_opacity_spin)
+        text_form.addRow("Border Width", self.text_border_width_spin)
+        text_form.addRow("Corner Radius", self.text_corner_radius_spin)
+        text_form.addRow("Frame Start", self.text_frame_start_spin)
+        text_form.addRow("Frame End", self.text_frame_end_spin)
+
+        props_container_layout.addWidget(self.common_props_group)
+        props_container_layout.addWidget(self.polygon_props_group)
+        props_container_layout.addWidget(self.route_props_group)
+        props_container_layout.addWidget(self.text_props_group)
+        props_container_layout.addStretch(1)
+        self.properties_scroll.setWidget(props_container)
+        selection_group_layout.addWidget(self.properties_scroll, 1)
+        layers_tab_layout.addWidget(selection_group, 2)
+
+        self.sidebar_tabs.addTab(self.layers_tab, "Layers")
 
         splitter.addWidget(side_panel)
         splitter.setStretchFactor(0, 1)
@@ -1109,6 +1300,15 @@ class MainWindow(QMainWindow):
         keyframe_timeline.addWidget(self.keyframe_track_label)
         keyframe_timeline.addWidget(self.keyframe_track, 1)
         root_layout.addLayout(keyframe_timeline)
+
+        time_timeline = QHBoxLayout()
+        self.time_track_label = QLabel("Time")
+        self.time_track_label.setFixedWidth(label_width)
+        self.time_track = PolygonKeyframeTrack()
+        self.time_track.setToolTip("Drag global time markers to retime the project year mapping across frames.")
+        time_timeline.addWidget(self.time_track_label)
+        time_timeline.addWidget(self.time_track, 1)
+        root_layout.addLayout(time_timeline)
 
         timeline = QHBoxLayout()
         timeline_title = QLabel("Timeline")
@@ -1133,6 +1333,7 @@ class MainWindow(QMainWindow):
         self.insert_keyframe_button.clicked.connect(self._insert_current_keyframe)
         self.delete_keyframe_button.clicked.connect(self._delete_current_keyframe)
         self.new_route_button.clicked.connect(self.canvas.begin_route_draw)
+        self.new_text_button.clicked.connect(self._new_text_layer)
         self.delete_layer_button.clicked.connect(self._delete_selected_layer)
         self.export_png_button.clicked.connect(self._export_png)
         self.export_video_button.clicked.connect(self._export_video)
@@ -1142,13 +1343,18 @@ class MainWindow(QMainWindow):
         self.keyframe_track.frameSelected.connect(self._set_current_frame)
         self.keyframe_track.keyframeMoved.connect(self._move_selected_polygon_keyframe)
         self.keyframe_track.keyframeMoveFinished.connect(self._announce_keyframe_move)
+        self.time_track.frameSelected.connect(self._set_current_frame)
+        self.time_track.keyframeMoved.connect(self._move_project_time_keyframe)
+        self.time_track.keyframeMoveFinished.connect(self._announce_time_keyframe_move)
         self.layer_list.currentRowChanged.connect(self._populate_layer_form)
         self.color_button.clicked.connect(self._pick_color)
+        self.text_background_color_button.clicked.connect(self._pick_text_background_color)
+        self.text_border_color_button.clicked.connect(self._pick_text_border_color)
         self.layer_name_edit.editingFinished.connect(self._apply_layer_form)
         self.layer_visible_check.stateChanged.connect(self._apply_layer_form)
         self.feather_spin.valueChanged.connect(self._apply_layer_form)
         self.rounding_spin.valueChanged.connect(self._apply_layer_form)
-        self.opacity_spin.valueChanged.connect(self._apply_layer_form)
+        self.polygon_opacity_spin.valueChanged.connect(self._apply_layer_form)
         self.polygon_constant_area_check.stateChanged.connect(self._apply_polygon_constant_area)
         self.polygon_easing_combo.currentIndexChanged.connect(self._apply_polygon_easing)
         self.route_width_spin.valueChanged.connect(self._apply_layer_form)
@@ -1157,12 +1363,31 @@ class MainWindow(QMainWindow):
         self.route_end_spin.valueChanged.connect(self._apply_layer_form)
         self.route_label_edit.editingFinished.connect(self._apply_layer_form)
         self.route_legend_check.stateChanged.connect(self._apply_layer_form)
+        self.text_template_edit.textChanged.connect(self._apply_layer_form)
+        self.text_opacity_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_anchor_combo.currentIndexChanged.connect(self._apply_layer_form)
+        self.text_align_combo.currentIndexChanged.connect(self._apply_layer_form)
+        self.text_font_size_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_offset_x_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_offset_y_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_padding_x_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_padding_y_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_background_opacity_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_border_opacity_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_border_width_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_corner_radius_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_frame_start_spin.valueChanged.connect(self._apply_layer_form)
+        self.text_frame_end_spin.valueChanged.connect(self._apply_layer_form)
         self.title_edit.editingFinished.connect(self._apply_project_form)
         self.duration_spin.valueChanged.connect(self._apply_project_form)
         self.fps_spin.valueChanged.connect(self._apply_project_form)
         self.fog_spin.valueChanged.connect(self._apply_project_form)
         self.video_format_combo.currentIndexChanged.connect(self._apply_video_format_selection)
         self.basemap_combo.currentIndexChanged.connect(self._apply_basemap_selection)
+        self.time_year_spin.valueChanged.connect(self._apply_time_keyframe_form)
+        self.time_label_edit.editingFinished.connect(self._apply_time_keyframe_form)
+        self.set_time_keyframe_button.clicked.connect(self._set_time_keyframe)
+        self.delete_time_keyframe_button.clicked.connect(self._delete_time_keyframe)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
         self.canvas.polygonKeyframesChanged.connect(self._refresh_keyframe_track)
         self.play_timer = QTimer(self)
@@ -1274,6 +1499,15 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
         QApplication.instance().setPalette(palette)
 
+    def _set_selected_panel_kind(self, kind: str | None) -> None:
+        has_layer = kind is not None
+        self.no_selection_label.setVisible(not has_layer)
+        self.properties_scroll.setVisible(has_layer)
+        self.common_props_group.setVisible(has_layer)
+        self.polygon_props_group.setVisible(kind == "polygon")
+        self.route_props_group.setVisible(kind == "route")
+        self.text_props_group.setVisible(kind == "text")
+
     def _reset_project(self, project: Project, project_path: str | None) -> None:
         self.project = project
         self.project_path = project_path
@@ -1340,6 +1574,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"[R] {layer.name}")
             item.setData(Qt.ItemDataRole.UserRole, ("route", layer.id))
             self.layer_list.addItem(item)
+        for layer in self.project.text_layers:
+            item = QListWidgetItem(f"[T] {layer.name}")
+            item.setData(Qt.ItemDataRole.UserRole, ("text", layer.id))
+            self.layer_list.addItem(item)
         if current_key is not None:
             for index in range(self.layer_list.count()):
                 item = self.layer_list.item(index)
@@ -1369,7 +1607,20 @@ class MainWindow(QMainWindow):
             for layer in self.project.route_layers:
                 if layer.id == layer_id:
                     return kind, layer
+        if kind == "text":
+            for layer in self.project.text_layers:
+                if layer.id == layer_id:
+                    return kind, layer
         return None, None
+
+    def _set_selected_layer_key(self, kind: str, layer_id: str) -> None:
+        target = (kind, layer_id)
+        for index in range(self.layer_list.count()):
+            item = self.layer_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == target:
+                self.layer_list.setCurrentRow(index)
+                self.sidebar_tabs.setCurrentWidget(self.layers_tab)
+                return
 
     def _populate_project_form(self) -> None:
         self._updating_form = True
@@ -1380,6 +1631,7 @@ class MainWindow(QMainWindow):
         self._refresh_video_format_selector()
         self._refresh_basemap_selector()
         self._updating_form = False
+        self._populate_time_form()
 
     def _apply_project_form(self) -> None:
         if self._updating_form:
@@ -1391,32 +1643,96 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self._refresh_canvas_only()
 
+    def _populate_time_form(self) -> None:
+        current_frame = int(self.timeline_slider.value())
+        exact_keyframe = self._selected_time_keyframe_at_current_frame()
+        current_year = interpolate_project_year(self.project, current_frame)
+        computed_label = project_time_label(self.project, current_frame)
+
+        self._updating_form = True
+        self.time_year_spin.setValue(float(current_year if current_year is not None else 0.0))
+        self.time_label_edit.setText(str(exact_keyframe.label if exact_keyframe is not None else ""))
+        self.time_label_edit.setPlaceholderText(
+            f"Optional exact-frame label ({computed_label})" if computed_label else "Optional exact-frame label, e.g. Present Day"
+        )
+        self.set_time_keyframe_button.setText("Update Time Keyframe" if exact_keyframe is not None else "Set Time Keyframe")
+        self.delete_time_keyframe_button.setEnabled(exact_keyframe is not None)
+        self._updating_form = False
+
+    def _apply_time_keyframe_form(self) -> None:
+        if self._updating_form:
+            return
+        keyframe = self._selected_time_keyframe_at_current_frame()
+        if keyframe is None:
+            return
+        keyframe.year = float(self.time_year_spin.value())
+        keyframe.label = self.time_label_edit.text().strip()
+        self._update_timeline_label(self.timeline_slider.value())
+        self._refresh_canvas_only()
+
+    def _selected_time_keyframe_at_current_frame(self) -> TimeKeyframe | None:
+        current_frame = int(self.timeline_slider.value())
+        for keyframe in sorted(self.project.time_keyframes, key=lambda item: int(item.frame)):
+            if int(keyframe.frame) == current_frame:
+                return keyframe
+        return None
+
+    def _set_time_keyframe(self) -> None:
+        current_frame = int(self.timeline_slider.value())
+        keyframe = self._selected_time_keyframe_at_current_frame()
+        if keyframe is None:
+            keyframe = TimeKeyframe(frame=current_frame)
+            self.project.time_keyframes.append(keyframe)
+        keyframe.year = float(self.time_year_spin.value())
+        keyframe.label = self.time_label_edit.text().strip()
+        self.project.time_keyframes.sort(key=lambda item: int(item.frame))
+        self._refresh_time_track()
+        self._populate_time_form()
+        self._update_timeline_label(current_frame)
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Time keyframe set at frame {current_frame}", 2500)
+
+    def _delete_time_keyframe(self) -> None:
+        current_frame = int(self.timeline_slider.value())
+        existing = self._selected_time_keyframe_at_current_frame()
+        if existing is None:
+            QMessageBox.information(self, "Delete Time Keyframe", f"No time keyframe at frame {current_frame}.")
+            return
+        self.project.time_keyframes = [item for item in self.project.time_keyframes if int(item.frame) != current_frame]
+        self._refresh_time_track()
+        self._populate_time_form()
+        self._update_timeline_label(current_frame)
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Time keyframe deleted at frame {current_frame}", 2500)
+
     def _populate_layer_form(self) -> None:
         kind, layer = self._selected_layer()
         self.canvas.set_selected_polygon_layer(layer.id if kind == "polygon" and layer is not None else None)
         self._refresh_keyframe_track()
+        self._set_selected_panel_kind(kind if layer is not None else None)
         self._updating_form = True
-        enabled = layer is not None
-        for widget in [
-            self.layer_name_edit,
-            self.layer_visible_check,
-            self.color_button,
-            self.feather_spin,
-            self.rounding_spin,
-            self.opacity_spin,
-            self.polygon_constant_area_check,
-            self.polygon_easing_combo,
-            self.route_width_spin,
-            self.route_reveal_spin,
-            self.route_start_spin,
-            self.route_end_spin,
-            self.route_label_edit,
-            self.route_legend_check,
-        ]:
-            widget.setEnabled(enabled)
         if layer is None:
             self.layer_name_edit.setText("")
+            self.layer_visible_check.setChecked(False)
             self._set_color_button([255, 255, 255])
+            self.polygon_opacity_spin.setValue(1.0)
+            self.text_template_edit.setPlainText("")
+            self.text_opacity_spin.setValue(1.0)
+            self.text_anchor_combo.setCurrentIndex(max(0, self.text_anchor_combo.findData("top_right")))
+            self.text_align_combo.setCurrentIndex(max(0, self.text_align_combo.findData("right")))
+            self.text_font_size_spin.setValue(48)
+            self.text_offset_x_spin.setValue(0.0)
+            self.text_offset_y_spin.setValue(0.0)
+            self.text_padding_x_spin.setValue(18)
+            self.text_padding_y_spin.setValue(12)
+            self._set_text_background_color_button([11, 15, 21])
+            self.text_background_opacity_spin.setValue(0.72)
+            self._set_text_border_color_button([225, 232, 242])
+            self.text_border_opacity_spin.setValue(0.28)
+            self.text_border_width_spin.setValue(1)
+            self.text_corner_radius_spin.setValue(12)
+            self.text_frame_start_spin.setValue(0)
+            self.text_frame_end_spin.setValue(-1)
             self._populate_polygon_easing_form(None, None, False)
             self._updating_form = False
             return
@@ -1424,32 +1740,45 @@ class MainWindow(QMainWindow):
         self.layer_visible_check.setChecked(layer.visible)
         self._set_color_button(layer.color)
         is_polygon = kind == "polygon"
-        self.feather_spin.setEnabled(is_polygon)
-        self.rounding_spin.setEnabled(is_polygon)
-        self.opacity_spin.setEnabled(is_polygon)
-        self.polygon_constant_area_check.setEnabled(is_polygon)
-        self.polygon_easing_combo.setEnabled(is_polygon)
-        self.route_width_spin.setEnabled(not is_polygon)
-        self.route_reveal_spin.setEnabled(not is_polygon)
-        self.route_start_spin.setEnabled(not is_polygon)
-        self.route_end_spin.setEnabled(not is_polygon)
-        self.route_label_edit.setEnabled(not is_polygon)
-        self.route_legend_check.setEnabled(not is_polygon)
+        is_route = kind == "route"
         self.route_start_spin.setMaximum(project_frame_max(self.project))
         self.route_end_spin.setMaximum(project_frame_max(self.project))
+        self.text_frame_start_spin.setMaximum(project_frame_max(self.project))
+        self.text_frame_end_spin.setMaximum(project_frame_max(self.project))
         if is_polygon:
             self.feather_spin.setValue(layer.feather_px)
             self.rounding_spin.setValue(layer.rounding_px)
-            self.opacity_spin.setValue(layer.opacity)
+            self.polygon_opacity_spin.setValue(layer.opacity)
             exact_keyframe, has_outgoing_segment = self._selected_polygon_keyframe_at_current_frame(layer)
             self._populate_polygon_easing_form(layer, exact_keyframe, has_outgoing_segment)
-        else:
+        elif is_route:
             self.route_width_spin.setValue(layer.width_px)
             self.route_reveal_spin.setValue(layer.reveal_px)
             self.route_start_spin.setValue(layer.start_frame)
             self.route_end_spin.setValue(layer.end_frame)
             self.route_label_edit.setText(layer.label)
             self.route_legend_check.setChecked(layer.show_in_legend)
+            self._populate_polygon_easing_form(None, None, False)
+        else:
+            self.text_opacity_spin.setValue(layer.opacity)
+            self.text_template_edit.setPlainText(layer.template)
+            self.text_font_size_spin.setValue(layer.font_size)
+            self.text_offset_x_spin.setValue(float(layer.offset_x) * 100.0)
+            self.text_offset_y_spin.setValue(float(layer.offset_y) * 100.0)
+            self.text_padding_x_spin.setValue(int(layer.padding_x))
+            self.text_padding_y_spin.setValue(int(layer.padding_y))
+            self.text_background_opacity_spin.setValue(float(layer.background_opacity))
+            self.text_border_opacity_spin.setValue(float(layer.border_opacity))
+            self.text_border_width_spin.setValue(int(layer.border_width))
+            self.text_corner_radius_spin.setValue(int(layer.corner_radius))
+            self.text_frame_start_spin.setValue(int(layer.frame_start))
+            self.text_frame_end_spin.setValue(int(layer.frame_end))
+            self._set_text_background_color_button(layer.background_color)
+            self._set_text_border_color_button(layer.border_color)
+            anchor_index = self.text_anchor_combo.findData(layer.anchor)
+            self.text_anchor_combo.setCurrentIndex(max(0, anchor_index))
+            align_index = self.text_align_combo.findData(layer.alignment)
+            self.text_align_combo.setCurrentIndex(max(0, align_index))
             self._populate_polygon_easing_form(None, None, False)
         self._updating_form = False
 
@@ -1553,23 +1882,54 @@ class MainWindow(QMainWindow):
         if kind == "polygon":
             layer.feather_px = int(self.feather_spin.value())
             layer.rounding_px = int(self.rounding_spin.value())
-            layer.opacity = float(self.opacity_spin.value())
-        else:
+            layer.opacity = float(self.polygon_opacity_spin.value())
+        elif kind == "route":
             layer.width_px = int(self.route_width_spin.value())
             layer.reveal_px = int(self.route_reveal_spin.value())
             layer.start_frame = int(self.route_start_spin.value())
             layer.end_frame = max(layer.start_frame, int(self.route_end_spin.value()))
             layer.label = self.route_label_edit.text().strip()
             layer.show_in_legend = self.route_legend_check.isChecked()
+        else:
+            layer.opacity = float(self.text_opacity_spin.value())
+            layer.template = self.text_template_edit.toPlainText().strip()
+            layer.anchor = str(self.text_anchor_combo.currentData() or "top_right")
+            layer.alignment = str(self.text_align_combo.currentData() or "right")
+            layer.font_size = int(self.text_font_size_spin.value())
+            layer.offset_x = float(self.text_offset_x_spin.value()) / 100.0
+            layer.offset_y = float(self.text_offset_y_spin.value()) / 100.0
+            layer.padding_x = int(self.text_padding_x_spin.value())
+            layer.padding_y = int(self.text_padding_y_spin.value())
+            layer.background_color = list(self.text_background_color_button.property("rgb") or layer.background_color)
+            layer.background_opacity = float(self.text_background_opacity_spin.value())
+            layer.border_color = list(self.text_border_color_button.property("rgb") or layer.border_color)
+            layer.border_opacity = float(self.text_border_opacity_spin.value())
+            layer.border_width = int(self.text_border_width_spin.value())
+            layer.corner_radius = int(self.text_corner_radius_spin.value())
+            layer.frame_start = int(self.text_frame_start_spin.value())
+            end_frame = int(self.text_frame_end_spin.value())
+            layer.frame_end = -1 if end_frame < 0 else max(layer.frame_start, end_frame)
         self._refresh_layer_list()
         self._refresh_canvas_only()
 
-    def _set_color_button(self, rgb: list[int]) -> None:
+    def _set_swatch_button(self, button: QPushButton, rgb: list[int], label: str) -> None:
         rgb = [int(v) for v in rgb[:3]]
-        self.color_button.setProperty("rgb", rgb)
-        self.color_button.setStyleSheet(
-            f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); color: rgb(15, 18, 22);"
+        luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+        text_rgb = (15, 18, 22) if luminance >= 150 else (233, 237, 242)
+        button.setProperty("rgb", rgb)
+        button.setText(label)
+        button.setStyleSheet(
+            f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); color: rgb({text_rgb[0]}, {text_rgb[1]}, {text_rgb[2]});"
         )
+
+    def _set_color_button(self, rgb: list[int]) -> None:
+        self._set_swatch_button(self.color_button, rgb, "Pick Color")
+
+    def _set_text_background_color_button(self, rgb: list[int]) -> None:
+        self._set_swatch_button(self.text_background_color_button, rgb, "Pick Background")
+
+    def _set_text_border_color_button(self, rgb: list[int]) -> None:
+        self._set_swatch_button(self.text_border_color_button, rgb, "Pick Border")
 
     def _pick_color(self) -> None:
         kind, layer = self._selected_layer()
@@ -1582,12 +1942,49 @@ class MainWindow(QMainWindow):
         self._set_color_button([color.red(), color.green(), color.blue()])
         self._apply_layer_form()
 
+    def _pick_text_background_color(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            return
+        current = self.text_background_color_button.property("rgb") or layer.background_color
+        color = QColorDialog.getColor(QColor(*current), self, "Pick Text Background Color")
+        if not color.isValid():
+            return
+        self._set_text_background_color_button([color.red(), color.green(), color.blue()])
+        self._apply_layer_form()
+
+    def _pick_text_border_color(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            return
+        current = self.text_border_color_button.property("rgb") or layer.border_color
+        color = QColorDialog.getColor(QColor(*current), self, "Pick Text Border Color")
+        if not color.isValid():
+            return
+        self._set_text_border_color_button([color.red(), color.green(), color.blue()])
+        self._apply_layer_form()
+
     def _begin_polygon_keyframe(self) -> None:
         kind, layer = self._selected_layer()
         if kind != "polygon" or layer is None:
             QMessageBox.information(self, "Polygon Keyframe", "Select a polygon layer first.")
             return
         self.canvas.begin_polygon_draw(layer.id)
+
+    def _new_text_layer(self) -> None:
+        index = len(self.project.text_layers) + 1
+        layer = TextOverlayLayer(
+            name=f"Text {index}",
+            template="Text Overlay",
+            frame_start=0,
+            frame_end=project_frame_max(self.project),
+        )
+        self.project.text_layers.append(layer)
+        self._refresh_layer_list()
+        self._set_selected_layer_key("text", layer.id)
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Text layer created: {layer.name}", 2500)
 
     def _insert_current_keyframe(self) -> None:
         kind, layer = self._selected_layer()
@@ -1637,8 +2034,10 @@ class MainWindow(QMainWindow):
             return
         if kind == "polygon":
             self.project.polygon_layers = [item for item in self.project.polygon_layers if item.id != layer.id]
-        else:
+        elif kind == "route":
             self.project.route_layers = [item for item in self.project.route_layers if item.id != layer.id]
+        else:
+            self.project.text_layers = [item for item in self.project.text_layers if item.id != layer.id]
         self._refresh_layer_list()
         self._populate_layer_form()
         self._refresh_canvas_only()
@@ -1691,13 +2090,16 @@ class MainWindow(QMainWindow):
         self.timeline_slider.setMaximum(project_frame_max(self.project))
         self.timeline_slider.setValue(current)
         self.timeline_slider.blockSignals(False)
-        self.timeline_label.setText(f"Frame {current} / {project_frame_max(self.project)}")
+        self._update_timeline_label(current)
         self.play_timer.setInterval(16)
         self._refresh_keyframe_track()
+        self._refresh_time_track()
+        self._populate_time_form()
 
     def _on_frame_changed(self, value: int) -> None:
-        self.timeline_label.setText(f"Frame {value} / {project_frame_max(self.project)}")
+        self._update_timeline_label(value)
         self.canvas.set_frame_index(value)
+        self._populate_time_form()
         self._populate_layer_form()
 
     def _set_current_frame(self, frame: int) -> None:
@@ -1711,6 +2113,13 @@ class MainWindow(QMainWindow):
             return []
         return sorted(layer.keyframes, key=lambda item: int(item.frame))
 
+    def _update_timeline_label(self, frame: int) -> None:
+        label = f"Frame {int(frame)} / {project_frame_max(self.project)}"
+        time_label = project_time_label(self.project, int(frame))
+        if time_label:
+            label = f"{label} | {time_label}"
+        self.timeline_label.setText(label)
+
     def _refresh_keyframe_track(self) -> None:
         keyframes = self._selected_polygon_keyframes()
         if keyframes:
@@ -1723,6 +2132,18 @@ class MainWindow(QMainWindow):
                 message = "Select a polygon layer to edit its keyframes."
 
         self.keyframe_track.set_state(
+            minimum=0,
+            maximum=project_frame_max(self.project),
+            current_frame=self.timeline_slider.value(),
+            keyframes=[int(item.frame) for item in keyframes],
+            interactive=bool(keyframes),
+            message=message,
+        )
+
+    def _refresh_time_track(self) -> None:
+        keyframes = sorted(self.project.time_keyframes, key=lambda item: int(item.frame))
+        message = "Drag a marker left or right to retime the project time mapping." if keyframes else "Set project time keyframes to drive {time_label} and {year} templates."
+        self.time_track.set_state(
             minimum=0,
             maximum=project_frame_max(self.project),
             current_frame=self.timeline_slider.value(),
@@ -1754,6 +2175,28 @@ class MainWindow(QMainWindow):
 
     def _announce_keyframe_move(self, _index: int, frame: int) -> None:
         self.statusBar().showMessage(f"Polygon keyframe moved to frame {frame}", 2500)
+
+    def _move_project_time_keyframe(self, index: int, frame: int) -> None:
+        keyframes = sorted(self.project.time_keyframes, key=lambda item: int(item.frame))
+        if not (0 <= index < len(keyframes)):
+            return
+
+        frame_values = [int(item.frame) for item in keyframes]
+        clamped_frame = clamp_keyframe_frame(frame_values, index, frame, 0, project_frame_max(self.project))
+        keyframes[index].frame = clamped_frame
+        keyframes.sort(key=lambda item: int(item.frame))
+        self.project.time_keyframes = keyframes
+
+        if clamped_frame != self.timeline_slider.value():
+            self.timeline_slider.setValue(clamped_frame)
+        else:
+            self._refresh_time_track()
+            self._populate_time_form()
+            self._update_timeline_label(clamped_frame)
+            self._refresh_canvas_only()
+
+    def _announce_time_keyframe_move(self, _index: int, frame: int) -> None:
+        self.statusBar().showMessage(f"Time keyframe moved to frame {frame}", 2500)
 
     def _refresh_canvas_only(self) -> None:
         self.canvas.invalidate_cache()
