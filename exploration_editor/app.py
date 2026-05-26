@@ -982,6 +982,10 @@ class MainWindow(QMainWindow):
         self.open_basemap_button = QPushButton("Open Basemap")
         self.new_polygon_button = QPushButton("New Polygon")
         self.add_keyframe_button = QPushButton("Add Polygon Keyframe")
+        self.insert_keyframe_button = QPushButton("Insert Keyframe")
+        self.insert_keyframe_button.setToolTip("Insert a new keyframe at the current frame, initialised from the interpolated polygon state.")
+        self.delete_keyframe_button = QPushButton("Delete Keyframe")
+        self.delete_keyframe_button.setToolTip("Delete the keyframe that is exactly at the current frame.")
         self.new_route_button = QPushButton("New Route")
         self.delete_layer_button = QPushButton("Delete Layer")
         self.export_png_button = QPushButton("Export PNG")
@@ -998,6 +1002,8 @@ class MainWindow(QMainWindow):
             self.open_basemap_button,
             self.new_polygon_button,
             self.add_keyframe_button,
+            self.insert_keyframe_button,
+            self.delete_keyframe_button,
             self.new_route_button,
             self.delete_layer_button,
             self.export_png_button,
@@ -1124,6 +1130,8 @@ class MainWindow(QMainWindow):
         self.open_basemap_button.clicked.connect(self._open_basemap)
         self.new_polygon_button.clicked.connect(lambda: self.canvas.begin_polygon_draw(None))
         self.add_keyframe_button.clicked.connect(self._begin_polygon_keyframe)
+        self.insert_keyframe_button.clicked.connect(self._insert_current_keyframe)
+        self.delete_keyframe_button.clicked.connect(self._delete_current_keyframe)
         self.new_route_button.clicked.connect(self.canvas.begin_route_draw)
         self.delete_layer_button.clicked.connect(self._delete_selected_layer)
         self.export_png_button.clicked.connect(self._export_png)
@@ -1580,6 +1588,48 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Polygon Keyframe", "Select a polygon layer first.")
             return
         self.canvas.begin_polygon_draw(layer.id)
+
+    def _insert_current_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            QMessageBox.information(self, "Insert Keyframe", "Select a polygon layer first.")
+            return
+        if not layer.keyframes:
+            QMessageBox.information(self, "Insert Keyframe", "Draw a polygon keyframe first.")
+            return
+        frame_index = self.timeline_slider.value()
+        if any(kf.frame == frame_index for kf in layer.keyframes):
+            QMessageBox.information(self, "Insert Keyframe", f"There is already a keyframe at frame {frame_index}.")
+            return
+        points = polygon_edit_points_at_frame(layer, frame_index)
+        if not points:
+            QMessageBox.information(self, "Insert Keyframe", "No polygon data at the current frame.")
+            return
+        layer.keyframes.append(PolygonKeyframe(frame=frame_index, points=points))
+        layer.keyframes.sort(key=lambda kf: kf.frame)
+        self._refresh_keyframe_track()
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Keyframe inserted at frame {frame_index}.", 2500)
+
+    def _delete_current_keyframe(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "polygon" or layer is None:
+            QMessageBox.information(self, "Delete Keyframe", "Select a polygon layer first.")
+            return
+        frame_index = self.timeline_slider.value()
+        existing = next((kf for kf in layer.keyframes if kf.frame == frame_index), None)
+        if existing is None:
+            QMessageBox.information(self, "Delete Keyframe", f"No keyframe at frame {frame_index}.")
+            return
+        if len(layer.keyframes) <= 1:
+            QMessageBox.information(self, "Delete Keyframe", "Cannot delete the last remaining keyframe.")
+            return
+        layer.keyframes = [kf for kf in layer.keyframes if kf.frame != frame_index]
+        self._refresh_keyframe_track()
+        self._populate_layer_form()
+        self._refresh_canvas_only()
+        self.statusBar().showMessage(f"Keyframe at frame {frame_index} deleted.", 2500)
 
     def _delete_selected_layer(self) -> None:
         kind, layer = self._selected_layer()
