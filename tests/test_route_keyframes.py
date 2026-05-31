@@ -4,6 +4,15 @@ from exploration_editor.model import RouteKeyframe, RouteLayer, project_to_dict,
 
 
 class RouteKeyframeTests(unittest.TestCase):
+    def test_route_layer_uses_current_style_defaults(self) -> None:
+        layer = RouteLayer()
+
+        self.assertEqual(layer.width_px, 1)
+        self.assertEqual(layer.reveal_px, 13)
+        self.assertEqual(layer.feather_px, 2)
+        self.assertEqual(layer.rounding_px, 300)
+        self.assertEqual(layer.draw_mode, "reveal_only")
+
     def test_route_progress_uses_start_end_without_keyframes(self) -> None:
         layer = RouteLayer(start_frame=10, end_frame=30)
 

@@ -235,6 +235,29 @@ class RenderViewTests(unittest.TestCase):
 
         self.assertNotEqual(list(reveal_only.getdata()), list(colored.getdata()))
 
+    def test_render_frame_route_reveal_only_antialiases_edges_without_feather(self) -> None:
+        project = Project(
+            width=120,
+            height=80,
+            fog_opacity=1.0,
+            fog_color=[0, 0, 0],
+            route_layers=[
+                RouteLayer(
+                    reveal_px=9,
+                    feather_px=0,
+                    draw_mode="reveal_only",
+                    keyframes=[RouteKeyframe(frame=0, progress=1.0)],
+                    points=[[-120.0, 50.0], [120.0, -50.0]],
+                )
+            ],
+        )
+        basemap = Image.new("RGB", (120, 80), (255, 255, 255))
+
+        image = render_frame(project, basemap_image=basemap, frame_index=0, output_size=(120, 80), preview=True)
+        red_channel = [pixel[0] for pixel in image.getdata()]
+
+        self.assertTrue(any(0 < value < 255 for value in red_channel))
+
 
 if __name__ == "__main__":
     unittest.main()

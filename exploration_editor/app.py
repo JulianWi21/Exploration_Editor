@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -44,11 +45,17 @@ from exploration_editor.geometry import (
     lonlat_to_world,
     polygon_edit_points_at_frame,
     resample_path,
+    rounded_open_path,
     world_to_lonlat,
     unwrap_longitudes,
 )
 from exploration_editor.model import (
     DEFAULT_BASEMAP_PATH,
+    DEFAULT_ROUTE_DRAW_MODE,
+    DEFAULT_ROUTE_FEATHER_PX,
+    DEFAULT_ROUTE_REVEAL_PX,
+    DEFAULT_ROUTE_ROUNDING_PX,
+    DEFAULT_ROUTE_WIDTH_PX,
     POLYGON_EASING_LINEAR,
     PolygonKeyframe,
     PolygonLayer,
@@ -352,10 +359,13 @@ class MapCanvas(QWidget):
         self.draw_kind: str | None = None
         self.target_layer_id: str | None = None
         self.selected_polygon_layer_id: str | None = None
+        self.selected_route_layer_id: str | None = None
         self.temp_points: list[list[float]] = []
         self.hover_point: list[float] | None = None
         self._dragging_vertex_index: int | None = None
         self._selected_vertex_index: int | None = None
+        self._dragging_route_point_index: int | None = None
+        self._selected_route_point_index: int | None = None
         self._preserve_interpolated_overlay_during_drag = False
         self.show_edit_overlays = True
         self.is_panning = False
@@ -396,10 +406,18 @@ class MapCanvas(QWidget):
         self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
+    def set_selected_route_layer(self, layer_id: str | None) -> None:
+        self.selected_route_layer_id = layer_id
+        self._dragging_route_point_index = None
+        self._selected_route_point_index = None
+        self.update()
+
     def set_show_edit_overlays(self, show_edit_overlays: bool) -> None:
         self.show_edit_overlays = bool(show_edit_overlays)
         self._dragging_vertex_index = None
         self._selected_vertex_index = None
+        self._dragging_route_point_index = None
+        self._selected_route_point_index = None
         self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
@@ -479,6 +497,14 @@ class MapCanvas(QWidget):
                 return layer
         return None
 
+    def _selected_route_layer(self) -> RouteLayer | None:
+        if not self.selected_route_layer_id:
+            return None
+        for layer in self.project.route_layers:
+            if layer.id == self.selected_route_layer_id:
+                return layer
+        return None
+
     def _find_polygon_keyframe(self, layer: PolygonLayer, frame: int) -> PolygonKeyframe | None:
         for keyframe in layer.keyframes:
             if int(keyframe.frame) == int(frame):
@@ -508,6 +534,14 @@ class MapCanvas(QWidget):
             return exact.points
         return polygon_edit_points_at_frame(layer, self.frame_index)
 
+    def _editable_route_points(self) -> list[list[float]]:
+        if self.draw_kind:
+            return []
+        layer = self._selected_route_layer()
+        if layer is None or not layer.visible or len(layer.points) < 2:
+            return []
+        return layer.points
+
     def _nearest_editable_vertex(self, x: float, y: float) -> int | None:
         if self._last_layout is None:
             return None
@@ -526,6 +560,52 @@ class MapCanvas(QWidget):
                     best_dist_sq = dist_sq
                     best_index = index
         return best_index
+
+    def _nearest_editable_route_point(self, x: float, y: float) -> int | None:
+        if self._last_layout is None:
+            return None
+        points = self._editable_route_points()
+        if len(points) < 2:
+            return None
+        tolerance_px = max(8.0, self.height() * 0.012)
+        best_index: int | None = None
+        best_dist_sq = tolerance_px * tolerance_px
+        for path in self._screen_variants(points):
+            for index, (sx, sy) in enumerate(path):
+                dx = sx - x
+                dy = sy - y
+                dist_sq = dx * dx + dy * dy
+                if dist_sq <= best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_index = index
+        return best_index
+
+    def _nearest_editable_route_edge(self, x: float, y: float) -> tuple[int, float] | None:
+        if self._last_layout is None:
+            return None
+        points = self._editable_route_points()
+        if len(points) < 2:
+            return None
+        tolerance_px = max(10.0, self.height() * 0.014)
+        best_match: tuple[int, float] | None = None
+        best_dist_sq = tolerance_px * tolerance_px
+
+        for path in self._screen_variants(points):
+            for index, (start_x, start_y) in enumerate(path[:-1]):
+                end_x, end_y = path[index + 1]
+                delta_x = end_x - start_x
+                delta_y = end_y - start_y
+                seg_len_sq = delta_x * delta_x + delta_y * delta_y
+                if seg_len_sq <= 1e-6:
+                    continue
+                t = clamp(((x - start_x) * delta_x + (y - start_y) * delta_y) / seg_len_sq, 0.0, 1.0)
+                proj_x = start_x + delta_x * t
+                proj_y = start_y + delta_y * t
+                dist_sq = (proj_x - x) * (proj_x - x) + (proj_y - y) * (proj_y - y)
+                if dist_sq <= best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_match = (index, float(t))
+        return best_match
 
     def _nearest_editable_edge(self, x: float, y: float) -> tuple[int, float] | None:
         if self._last_layout is None:
@@ -678,12 +758,48 @@ class MapCanvas(QWidget):
         self.polygonKeyframesChanged.emit()
         return True
 
+    def insert_selected_route_point(self, x: float, y: float) -> bool:
+        if self.draw_kind or not self.show_edit_overlays:
+            return False
+        if self._nearest_editable_route_point(x, y) is not None:
+            return False
+        edge_match = self._nearest_editable_route_edge(x, y)
+        layer = self._selected_route_layer()
+        point = self._screen_to_lonlat(x, y)
+        if edge_match is None or layer is None or point is None:
+            return False
+
+        edge_index, _edge_t = edge_match
+        insert_index = min(len(layer.points), edge_index + 1)
+        layer.points.insert(insert_index, point)
+        self._selected_route_point_index = insert_index
+        self._dragging_route_point_index = None
+        self._render_now()
+        return True
+
+    def delete_selected_route_point(self) -> bool:
+        if self.draw_kind or not self.show_edit_overlays:
+            return False
+        layer = self._selected_route_layer()
+        if layer is None or self._selected_route_point_index is None:
+            return False
+        if len(layer.points) <= 2 or not (0 <= self._selected_route_point_index < len(layer.points)):
+            return False
+
+        delete_index = self._selected_route_point_index
+        layer.points.pop(delete_index)
+        self._selected_route_point_index = min(delete_index, len(layer.points) - 1)
+        self._dragging_route_point_index = None
+        self._render_now()
+        return True
+
     def begin_polygon_draw(self, target_layer_id: str | None = None) -> None:
         self.draw_kind = "polygon"
         self.target_layer_id = target_layer_id
         self.temp_points = []
         self.hover_point = None
         self._selected_vertex_index = None
+        self._selected_route_point_index = None
         self.update()
 
     def begin_route_draw(self) -> None:
@@ -692,6 +808,7 @@ class MapCanvas(QWidget):
         self.temp_points = []
         self.hover_point = None
         self._selected_vertex_index = None
+        self._selected_route_point_index = None
         self.update()
 
     def cancel_drawing(self) -> None:
@@ -700,13 +817,17 @@ class MapCanvas(QWidget):
         self.temp_points = []
         self.hover_point = None
         self._dragging_vertex_index = None
+        self._dragging_route_point_index = None
         self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
     def paintEvent(self, _event) -> None:
         frame_size = (max(2, self.width()), max(2, self.height()))
         layout = compute_map_layout(frame_size, self.basemap_image.size, self.project.view)
-        freeze_preview = self._dragging_vertex_index is not None and self._cached_qimage is not None
+        freeze_preview = (
+            (self._dragging_vertex_index is not None or self._dragging_route_point_index is not None)
+            and self._cached_qimage is not None
+        )
         preview_frame_size = self._preview_render_size(frame_size)
         render_project = self.project
         if preview_frame_size != frame_size:
@@ -758,6 +879,7 @@ class MapCanvas(QWidget):
             painter.drawImage(self.rect(), self._cached_qimage)
         if self.show_edit_overlays:
             self._draw_selected_polygon_overlay(painter)
+            self._draw_selected_route_overlay(painter)
             self._draw_temp_overlay(painter)
         painter.end()
 
@@ -804,18 +926,78 @@ class MapCanvas(QWidget):
                 painter.drawEllipse(QPointF(x, y), 2.9, 2.9)
                 painter.setPen(pen)
 
+    def _draw_selected_route_overlay(self, painter: QPainter) -> None:
+        if self.draw_kind or self._last_layout is None:
+            return
+        layer = self._selected_route_layer()
+        points = self._editable_route_points()
+        if layer is None or len(points) < 2:
+            return
+
+        style_scale = max(0.01, float(self.height()) / float(max(1, int(self.project.height))))
+        outline = QColor(layer.color[0], layer.color[1], layer.color[2], 235)
+        handle_outer = QColor(6, 8, 12, 220)
+        handle_inner = QColor(245, 248, 252, 235)
+        selected_handle = QColor(88, 170, 255, 245)
+        active_handle = QColor(255, 208, 84, 245)
+
+        pen = QPen(outline)
+        pen.setWidth(3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        for path in self._screen_variants(points):
+            rounded_path = rounded_open_path(path, float(getattr(layer, "rounding_px", 0.0)) * style_scale)
+            painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in rounded_path]))
+
+        for path in self._screen_variants(points):
+            for index, (x, y) in enumerate(path):
+                painter.setPen(Qt.PenStyle.NoPen)
+                if index == self._dragging_route_point_index:
+                    painter.setBrush(active_handle)
+                elif index == self._selected_route_point_index:
+                    painter.setBrush(selected_handle)
+                else:
+                    painter.setBrush(handle_outer)
+                painter.drawEllipse(QPointF(x, y), 5.5, 5.5)
+                painter.setBrush(handle_inner)
+                painter.drawEllipse(QPointF(x, y), 2.9, 2.9)
+                painter.setPen(pen)
+
     def _draw_temp_overlay(self, painter: QPainter) -> None:
         if not self.draw_kind or not self.temp_points or self._last_layout is None:
             return
-        pen = QPen(QColor(255, 255, 255, 230))
-        pen.setWidth(3)
-        painter.setPen(pen)
+        route_pen: QPen | None = None
+        route_handle_pen: QPen | None = None
+        if self.draw_kind == "route":
+            style_scale = max(0.01, float(self.height()) / float(max(1, int(self.project.height))))
+            route_pen = QPen(QColor(255, 255, 255, 230))
+            route_pen.setWidth(3)
+            route_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            route_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            route_handle_pen = QPen(QColor(255, 255, 255, 230))
+            route_handle_pen.setWidth(3)
+            painter.setPen(route_pen)
+        else:
+            pen = QPen(QColor(255, 255, 255, 230))
+            pen.setWidth(3)
+            painter.setPen(pen)
+
         for path in self._screen_variants(self._preview_points()):
-            polygon = QPolygonF([QPointF(x, y) for x, y in path])
+            draw_path = path
+            if self.draw_kind == "route":
+                if route_pen is not None:
+                    painter.setPen(route_pen)
+                draw_path = rounded_open_path(path, DEFAULT_ROUTE_ROUNDING_PX * style_scale)
+            polygon = QPolygonF([QPointF(x, y) for x, y in draw_path])
             if self.draw_kind == "polygon" and len(path) >= 3:
                 painter.drawPolygon(polygon)
             else:
                 painter.drawPolyline(polygon)
+            if self.draw_kind == "route" and route_handle_pen is not None:
+                painter.setPen(route_handle_pen)
             for x, y in path:
                 painter.setBrush(QColor(8, 10, 14, 220))
                 painter.drawEllipse(QPointF(x, y), 4.5, 4.5)
@@ -906,6 +1088,20 @@ class MapCanvas(QWidget):
                 self.cancel_drawing()
             return
         if event.button() == Qt.MouseButton.LeftButton:
+            route_handle_index = self._nearest_editable_route_point(pos.x(), pos.y())
+            if route_handle_index is not None:
+                layer = self._selected_route_layer()
+                if layer is not None and 0 <= route_handle_index < len(layer.points):
+                    self._selected_route_point_index = route_handle_index
+                    self._dragging_route_point_index = route_handle_index
+                    self._interactive_render_timer.stop()
+                    point = self._screen_to_lonlat(pos.x(), pos.y())
+                    if point is not None:
+                        layer.points[route_handle_index] = point
+                    self.update()
+                    return
+            self._selected_route_point_index = None
+
             handle_index = self._nearest_editable_vertex(pos.x(), pos.y())
             if handle_index is not None:
                 layer = self._selected_polygon_layer()
@@ -944,6 +1140,13 @@ class MapCanvas(QWidget):
             self.hover_point = self._screen_to_lonlat(pos.x(), pos.y())
             self.update()
             return
+        if self._dragging_route_point_index is not None:
+            point = self._screen_to_lonlat(pos.x(), pos.y())
+            layer = self._selected_route_layer()
+            if point is not None and layer is not None and 0 <= self._dragging_route_point_index < len(layer.points):
+                layer.points[self._dragging_route_point_index] = point
+                self.update()
+            return
         if self._dragging_vertex_index is not None:
             point = self._screen_to_lonlat(pos.x(), pos.y())
             layer = self._selected_polygon_layer()
@@ -963,6 +1166,9 @@ class MapCanvas(QWidget):
             self._schedule_interactive_render()
 
     def mouseReleaseEvent(self, _event) -> None:
+        if self._dragging_route_point_index is not None:
+            self._dragging_route_point_index = None
+            self._render_now()
         if self._dragging_vertex_index is not None:
             self._dragging_vertex_index = None
             self._preserve_interpolated_overlay_during_drag = False
@@ -973,6 +1179,8 @@ class MapCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, event) -> None:
         if not self.draw_kind and event.button() == Qt.MouseButton.LeftButton:
+            if self.insert_selected_route_point(event.position().x(), event.position().y()):
+                return
             if self.insert_selected_polygon_vertex(event.position().x(), event.position().y()):
                 return
         if not self.draw_kind:
@@ -1175,7 +1383,10 @@ class MainWindow(QMainWindow):
 
         self.properties_scroll = QScrollArea()
         self.properties_scroll.setWidgetResizable(True)
+        self.properties_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         props_container = QWidget()
+        props_container.setMinimumWidth(0)
+        props_container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         props_container_layout = QVBoxLayout(props_container)
         props_container_layout.setContentsMargins(0, 0, 0, 0)
         props_container_layout.setSpacing(10)
@@ -1858,6 +2069,7 @@ class MainWindow(QMainWindow):
     def _populate_layer_form(self) -> None:
         kind, layer = self._selected_layer()
         self.canvas.set_selected_polygon_layer(layer.id if kind == "polygon" and layer is not None else None)
+        self.canvas.set_selected_route_layer(layer.id if kind == "route" and layer is not None else None)
         self._refresh_keyframe_track()
         self._set_selected_panel_kind(kind if layer is not None else None)
         self._updating_form = True
@@ -1871,9 +2083,11 @@ class MainWindow(QMainWindow):
             self.set_route_keyframe_button.setText("Set Route Keyframe")
             self.set_route_keyframe_button.setEnabled(False)
             self.delete_route_keyframe_button.setEnabled(False)
-            self.route_feather_spin.setValue(12)
-            self.route_rounding_spin.setValue(120)
-            self.route_draw_mode_combo.setCurrentIndex(max(0, self.route_draw_mode_combo.findData("colored")))
+            self.route_width_spin.setValue(DEFAULT_ROUTE_WIDTH_PX)
+            self.route_reveal_spin.setValue(DEFAULT_ROUTE_REVEAL_PX)
+            self.route_feather_spin.setValue(DEFAULT_ROUTE_FEATHER_PX)
+            self.route_rounding_spin.setValue(DEFAULT_ROUTE_ROUNDING_PX)
+            self.route_draw_mode_combo.setCurrentIndex(max(0, self.route_draw_mode_combo.findData(DEFAULT_ROUTE_DRAW_MODE)))
             self.text_keyframe_status_label.setText("Default text used for this layer.")
             self.text_template_edit.setPlainText("")
             self.set_text_keyframe_button.setText("Set Text Keyframe")
@@ -1916,13 +2130,13 @@ class MainWindow(QMainWindow):
         elif is_route:
             self.route_width_spin.setValue(layer.width_px)
             self.route_reveal_spin.setValue(layer.reveal_px)
-            self.route_feather_spin.setValue(getattr(layer, "feather_px", 12))
-            self.route_rounding_spin.setValue(getattr(layer, "rounding_px", 120))
+            self.route_feather_spin.setValue(getattr(layer, "feather_px", DEFAULT_ROUTE_FEATHER_PX))
+            self.route_rounding_spin.setValue(getattr(layer, "rounding_px", DEFAULT_ROUTE_ROUNDING_PX))
             self.route_start_spin.setValue(layer.start_frame)
             self.route_end_spin.setValue(layer.end_frame)
             self.route_label_edit.setText(layer.label)
             self.route_legend_check.setChecked(layer.show_in_legend)
-            draw_mode_index = self.route_draw_mode_combo.findData(getattr(layer, "draw_mode", "colored"))
+            draw_mode_index = self.route_draw_mode_combo.findData(getattr(layer, "draw_mode", DEFAULT_ROUTE_DRAW_MODE))
             self.route_draw_mode_combo.setCurrentIndex(max(0, draw_mode_index))
             self.set_route_keyframe_button.setEnabled(True)
             self._populate_route_form(layer)
@@ -2382,6 +2596,7 @@ class MainWindow(QMainWindow):
             )
             self.project.route_layers.append(layer)
             self._refresh_layer_list()
+            self._set_selected_layer_key("route", layer.id)
         self._populate_layer_form()
         self._refresh_canvas_only()
 
@@ -2615,6 +2830,9 @@ class MainWindow(QMainWindow):
             self._set_final_preview_mode(not self.final_preview_button.isChecked())
             return
         if event.key() == Qt.Key.Key_Delete:
+            if self.canvas.delete_selected_route_point():
+                self.statusBar().showMessage("Route point deleted", 2500)
+                return
             if self.canvas.delete_selected_vertex():
                 self.statusBar().showMessage("Polygon point deleted", 2500)
                 return

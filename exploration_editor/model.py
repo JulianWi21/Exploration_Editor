@@ -33,6 +33,11 @@ TEXT_ALIGN_MODES = (
     "center",
     "right",
 )
+DEFAULT_ROUTE_WIDTH_PX = 1
+DEFAULT_ROUTE_REVEAL_PX = 13
+DEFAULT_ROUTE_FEATHER_PX = 2
+DEFAULT_ROUTE_ROUNDING_PX = 300
+DEFAULT_ROUTE_DRAW_MODE = "reveal_only"
 
 
 _TEMPLATE_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
@@ -74,15 +79,15 @@ class RouteLayer:
     id: str = field(default_factory=lambda: _uid("route"))
     name: str = "Route"
     color: list[int] = field(default_factory=lambda: [190, 228, 255])
-    width_px: int = 6
-    reveal_px: int = 28
-    feather_px: int = 12
-    rounding_px: int = 120
+    width_px: int = DEFAULT_ROUTE_WIDTH_PX
+    reveal_px: int = DEFAULT_ROUTE_REVEAL_PX
+    feather_px: int = DEFAULT_ROUTE_FEATHER_PX
+    rounding_px: int = DEFAULT_ROUTE_ROUNDING_PX
     start_frame: int = 0
     end_frame: int = 120
     label: str = ""
     show_in_legend: bool = True
-    draw_mode: str = "colored"
+    draw_mode: str = DEFAULT_ROUTE_DRAW_MODE
     visible: bool = True
     points: list[list[float]] = field(default_factory=list)
     keyframes: list["RouteKeyframe"] = field(default_factory=list)
@@ -241,15 +246,15 @@ def _route_from_dict(data: dict[str, Any]) -> RouteLayer:
         id=str(data.get("id") or _uid("route")),
         name=str(data.get("name") or "Route"),
         color=_coerce_color(data.get("color", [190, 228, 255]), [190, 228, 255]),
-        width_px=max(1, int(data.get("width_px", 6))),
-        reveal_px=max(1, int(data.get("reveal_px", 28))),
-        feather_px=max(0, int(data.get("feather_px", 12))),
-        rounding_px=max(0, int(data.get("rounding_px", 120))),
+        width_px=max(1, int(data.get("width_px", DEFAULT_ROUTE_WIDTH_PX))),
+        reveal_px=max(1, int(data.get("reveal_px", DEFAULT_ROUTE_REVEAL_PX))),
+        feather_px=max(0, int(data.get("feather_px", DEFAULT_ROUTE_FEATHER_PX))),
+        rounding_px=max(0, int(data.get("rounding_px", DEFAULT_ROUTE_ROUNDING_PX))),
         start_frame=int(data.get("start_frame", 0)),
         end_frame=int(data.get("end_frame", 120)),
         label=str(data.get("label") or ""),
         show_in_legend=bool(data.get("show_in_legend", True)),
-        draw_mode=str(data.get("draw_mode") or "colored").strip().lower() or "colored",
+        draw_mode=str(data.get("draw_mode") or DEFAULT_ROUTE_DRAW_MODE).strip().lower() or DEFAULT_ROUTE_DRAW_MODE,
         visible=bool(data.get("visible", True)),
         points=_coerce_points(data.get("points", [])),
         keyframes=keyframes,

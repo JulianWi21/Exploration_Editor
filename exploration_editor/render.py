@@ -154,7 +154,19 @@ def _screen_path_prefix(path: list[tuple[float, float]], progress: float) -> lis
     return result
 
 
-def _route_screen_variants(layer: RouteLayer, frame_index: int, layout: dict[str, float]) -> list[list[tuple[float, float]]]:
+_ROUTE_ANTIALIAS_SCALE = 2
+
+
+def _route_style_scale(project: Project, frame_size: tuple[int, int]) -> float:
+    return max(0.01, float(frame_size[1]) / float(max(1, int(project.height))))
+
+
+def _route_screen_variants(
+    layer: RouteLayer,
+    frame_index: int,
+    layout: dict[str, float],
+    style_scale: float = 1.0,
+) -> list[list[tuple[float, float]]]:
     if len(layer.points) < 2:
         return []
     progress = route_layer_progress_at_frame(layer, frame_index)
@@ -163,8 +175,9 @@ def _route_screen_variants(layer: RouteLayer, frame_index: int, layout: dict[str
 
     variants = _screen_path_variants(layer.points, layout)
     result: list[list[tuple[float, float]]] = []
+    rounding_px = float(getattr(layer, "rounding_px", 0.0)) * float(style_scale)
     for variant in variants:
-        smooth_path = rounded_open_path(variant, float(getattr(layer, "rounding_px", 0.0)))
+        smooth_path = rounded_open_path(variant, rounding_px)
         result.append(_screen_path_prefix(smooth_path, progress))
     return result
 
@@ -183,6 +196,50 @@ def _draw_round_capped_polyline(draw: ImageDraw.ImageDraw, path: list[tuple[floa
     end_x, end_y = path[-1]
     draw.ellipse([start_x - radius, start_y - radius, start_x + radius, start_y + radius], fill=fill)
     draw.ellipse([end_x - radius, end_y - radius, end_x + radius, end_y + radius], fill=fill)
+
+
+def _draw_antialiased_round_capped_polyline_layer(
+    frame_size: tuple[int, int],
+    paths: list[list[tuple[float, float]]],
+    fill,
+    width: int,
+    mode: str,
+) -> Image.Image:
+    width = max(1, int(width))
+    scale = _ROUTE_ANTIALIAS_SCALE
+    scaled_size = (max(1, frame_size[0] * scale), max(1, frame_size[1] * scale))
+    layer = Image.new(mode, scaled_size, 0 if mode == "L" else (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    scaled_width = max(1, int(round(width * scale)))
+    for path in paths:
+        if not path:
+            continue
+        scaled_path = [(float(x) * scale, float(y) * scale) for x, y in path]
+        _draw_round_capped_polyline(draw, scaled_path, fill=fill, width=scaled_width)
+    return layer.resize(frame_size, resample=Image.Resampling.LANCZOS)
+
+
+def _build_route_reveal_layer(frame_size: tuple[int, int], paths: list[list[tuple[float, float]]], width: int, feather: int) -> Image.Image:
+    width = max(1, int(width))
+    feather = max(0, int(feather))
+    core = _draw_antialiased_round_capped_polyline_layer(frame_size, paths, 255, width, "L")
+    if feather <= 0:
+        return core
+    soft_width = max(width, width + feather * 2)
+    soft = _draw_antialiased_round_capped_polyline_layer(frame_size, paths, 255, soft_width, "L")
+    soft = soft.filter(ImageFilter.GaussianBlur(radius=feather))
+    return _lighter_mask(core, soft)
+
+
+def _paint_antialiased_route(
+    overlay: Image.Image,
+    paths: list[list[tuple[float, float]]],
+    fill,
+    width: int,
+) -> None:
+    route_layer = _draw_antialiased_round_capped_polyline_layer(overlay.size, paths, fill, width, "RGBA")
+    composed = Image.alpha_composite(overlay, route_layer)
+    overlay.paste(composed, (0, 0))
 
 
 def _rounded_screen_variants(points: list[list[float]], layout: dict[str, float], radius: float) -> list[list[tuple[float, float]]]:
@@ -398,13 +455,13 @@ def _build_reveal_mask(
     for layer in project.route_layers:
         if not layer.visible or len(layer.points) < 2:
             continue
-        temp = Image.new("L", frame_size, 0)
-        draw = ImageDraw.Draw(temp)
-        for path in _route_screen_variants(layer, frame_index, layout):
-            _draw_round_capped_polyline(draw, path, fill=255, width=max(1, int(layer.reveal_px)))
-        blur_radius = max(0, int(getattr(layer, "feather_px", 0)))
-        if blur_radius > 0:
-            temp = temp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        style_scale = _route_style_scale(project, frame_size)
+        paths = _route_screen_variants(layer, frame_index, layout, style_scale=style_scale)
+        if not paths:
+            continue
+        reveal_width = _scale_frame_value(layer.reveal_px, style_scale, minimum=1)
+        feather_px = _scale_frame_value(getattr(layer, "feather_px", 0), style_scale, minimum=0)
+        temp = _build_route_reveal_layer(frame_size, paths, reveal_width, feather_px)
         reveal = _lighter_mask(reveal, temp)
 
     return reveal
@@ -566,7 +623,7 @@ def _draw_routes(
     layout: dict[str, float],
 ) -> None:
     overlay = Image.new("RGBA", frame_img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    style_scale = _route_style_scale(project, frame_img.size)
     for layer in project.route_layers:
         if not layer.visible or len(layer.points) < 2:
             continue
@@ -574,10 +631,13 @@ def _draw_routes(
             continue
         if str(getattr(layer, "draw_mode", "colored")) == "reveal_only":
             continue
-        for path in _route_screen_variants(layer, frame_index, layout):
-            halo_width = max(3, int(layer.width_px) + 4)
-            _draw_round_capped_polyline(draw, path, fill=(255, 255, 255, 155), width=halo_width)
-            _draw_round_capped_polyline(draw, path, fill=tuple(layer.color[:3]) + (235,), width=max(1, int(layer.width_px)))
+        paths = _route_screen_variants(layer, frame_index, layout, style_scale=style_scale)
+        if not paths:
+            continue
+        stroke_width = _scale_frame_value(layer.width_px, style_scale, minimum=1)
+        halo_width = max(stroke_width + _scale_frame_value(4, style_scale, minimum=1), _scale_frame_value(3, style_scale, minimum=1))
+        _paint_antialiased_route(overlay, paths, fill=(255, 255, 255, 155), width=halo_width)
+        _paint_antialiased_route(overlay, paths, fill=tuple(layer.color[:3]) + (235,), width=stroke_width)
     composed = Image.alpha_composite(frame_img.convert("RGBA"), overlay)
     frame_img.paste(composed.convert("RGB"), (0, 0))
 
