@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 from pathlib import Path
+import re
 import sys
 import time
 
 from PIL import Image
 from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPolygonF
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPolygonF, QTextCharFormat
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,7 +27,6 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -34,6 +35,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -72,9 +75,10 @@ from exploration_editor.model import (
     route_layer_progress_at_frame,
     save_project,
     text_overlay_template_at_frame,
+    text_template_is_rich,
 )
 from exploration_editor.paths import exploration_examples_dir, exploration_exports_dir
-from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame, render_frame
+from exploration_editor.render import clamp_view_state, compute_map_layout, polygon_outline_screen_paths_at_frame, render_frame, text_overlay_panel_layouts
 
 
 POLYGON_COLORS = [
@@ -121,6 +125,8 @@ ROUTE_DRAW_MODE_OPTIONS = [
     ("Colored Line", "colored"),
     ("Reveal Only", "reveal_only"),
 ]
+
+_HTML_BODY_RE = re.compile(r"<body[^>]*>(.*)</body>", re.IGNORECASE | re.DOTALL)
 
 
 def _pil_to_qimage(image) -> QImage:
@@ -345,6 +351,7 @@ class MapCanvas(QWidget):
     drawingFinished = pyqtSignal(object)
     viewChanged = pyqtSignal()
     polygonKeyframesChanged = pyqtSignal()
+    textLayerMoveFinished = pyqtSignal()
 
     def __init__(self, font_path: str | Path | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -360,12 +367,14 @@ class MapCanvas(QWidget):
         self.target_layer_id: str | None = None
         self.selected_polygon_layer_id: str | None = None
         self.selected_route_layer_id: str | None = None
+        self.selected_text_layer_id: str | None = None
         self.temp_points: list[list[float]] = []
         self.hover_point: list[float] | None = None
         self._dragging_vertex_index: int | None = None
         self._selected_vertex_index: int | None = None
         self._dragging_route_point_index: int | None = None
         self._selected_route_point_index: int | None = None
+        self._dragging_text_layer = False
         self._preserve_interpolated_overlay_during_drag = False
         self.show_edit_overlays = True
         self.is_panning = False
@@ -412,12 +421,18 @@ class MapCanvas(QWidget):
         self._selected_route_point_index = None
         self.update()
 
+    def set_selected_text_layer(self, layer_id: str | None) -> None:
+        self.selected_text_layer_id = layer_id
+        self._dragging_text_layer = False
+        self.update()
+
     def set_show_edit_overlays(self, show_edit_overlays: bool) -> None:
         self.show_edit_overlays = bool(show_edit_overlays)
         self._dragging_vertex_index = None
         self._selected_vertex_index = None
         self._dragging_route_point_index = None
         self._selected_route_point_index = None
+        self._dragging_text_layer = False
         self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
@@ -504,6 +519,31 @@ class MapCanvas(QWidget):
             if layer.id == self.selected_route_layer_id:
                 return layer
         return None
+
+    def _selected_text_layer(self) -> TextOverlayLayer | None:
+        if not self.selected_text_layer_id:
+            return None
+        for layer in self.project.text_layers:
+            if layer.id == self.selected_text_layer_id:
+                return layer
+        return None
+
+    def _selected_text_panel_rect(self) -> tuple[float, float, float, float] | None:
+        layer = self._selected_text_layer()
+        if layer is None:
+            return None
+        frame_size = (max(2, self.width()), max(2, self.height()))
+        for item in text_overlay_panel_layouts(self.project, self.frame_index, frame_size, self.font_path):
+            if item.layer_id == layer.id:
+                return item.panel_rect
+        return None
+
+    def _text_panel_hit_test(self, x: float, y: float) -> bool:
+        rect = self._selected_text_panel_rect()
+        if rect is None:
+            return False
+        panel_x, panel_y, panel_w, panel_h = rect
+        return panel_x <= x <= panel_x + panel_w and panel_y <= y <= panel_y + panel_h
 
     def _find_polygon_keyframe(self, layer: PolygonLayer, frame: int) -> PolygonKeyframe | None:
         for keyframe in layer.keyframes:
@@ -818,6 +858,7 @@ class MapCanvas(QWidget):
         self.hover_point = None
         self._dragging_vertex_index = None
         self._dragging_route_point_index = None
+        self._dragging_text_layer = False
         self._preserve_interpolated_overlay_during_drag = False
         self.update()
 
@@ -880,6 +921,7 @@ class MapCanvas(QWidget):
         if self.show_edit_overlays:
             self._draw_selected_polygon_overlay(painter)
             self._draw_selected_route_overlay(painter)
+            self._draw_selected_text_overlay(painter)
             self._draw_temp_overlay(painter)
         painter.end()
 
@@ -965,6 +1007,20 @@ class MapCanvas(QWidget):
                 painter.setBrush(handle_inner)
                 painter.drawEllipse(QPointF(x, y), 2.9, 2.9)
                 painter.setPen(pen)
+
+    def _draw_selected_text_overlay(self, painter: QPainter) -> None:
+        if self.draw_kind:
+            return
+        rect = self._selected_text_panel_rect()
+        if rect is None:
+            return
+        panel_x, panel_y, panel_w, panel_h = rect
+        pen = QPen(QColor(88, 170, 255, 240))
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QColor(88, 170, 255, 28))
+        painter.drawRoundedRect(QRectF(panel_x, panel_y, panel_w, panel_h), 10.0, 10.0)
 
     def _draw_temp_overlay(self, painter: QPainter) -> None:
         if not self.draw_kind or not self.temp_points or self._last_layout is None:
@@ -1088,6 +1144,12 @@ class MapCanvas(QWidget):
                 self.cancel_drawing()
             return
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._text_panel_hit_test(pos.x(), pos.y()):
+                self._dragging_text_layer = True
+                self.last_mouse_pos = (pos.x(), pos.y())
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return
+
             route_handle_index = self._nearest_editable_route_point(pos.x(), pos.y())
             if route_handle_index is not None:
                 layer = self._selected_route_layer()
@@ -1140,6 +1202,19 @@ class MapCanvas(QWidget):
             self.hover_point = self._screen_to_lonlat(pos.x(), pos.y())
             self.update()
             return
+        if self._dragging_text_layer:
+            layer = self._selected_text_layer()
+            if layer is not None and self.last_mouse_pos is not None:
+                width = max(1.0, float(self.width()))
+                height = max(1.0, float(self.height()))
+                dx = pos.x() - self.last_mouse_pos[0]
+                dy = pos.y() - self.last_mouse_pos[1]
+                layer.offset_x += dx / width
+                layer.offset_y += dy / height
+                self.last_mouse_pos = (pos.x(), pos.y())
+                self.invalidate_cache()
+                self.update()
+            return
         if self._dragging_route_point_index is not None:
             point = self._screen_to_lonlat(pos.x(), pos.y())
             layer = self._selected_route_layer()
@@ -1164,8 +1239,19 @@ class MapCanvas(QWidget):
             self._constrain_view()
             self.last_mouse_pos = (pos.x(), pos.y())
             self._schedule_interactive_render()
+            return
+
+        if self._text_panel_hit_test(pos.x(), pos.y()):
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.unsetCursor()
 
     def mouseReleaseEvent(self, _event) -> None:
+        if self._dragging_text_layer:
+            self._dragging_text_layer = False
+            self.unsetCursor()
+            self._render_now()
+            self.textLayerMoveFinished.emit()
         if self._dragging_route_point_index is not None:
             self._dragging_route_point_index = None
             self._render_now()
@@ -1176,6 +1262,11 @@ class MapCanvas(QWidget):
             self.polygonKeyframesChanged.emit()
         self.is_panning = False
         self.last_mouse_pos = None
+
+    def leaveEvent(self, event) -> None:
+        if not self._dragging_text_layer:
+            self.unsetCursor()
+        super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
         if not self.draw_kind and event.button() == Qt.MouseButton.LeftButton:
@@ -1214,6 +1305,8 @@ class MainWindow(QMainWindow):
         self._playback_start_time: float | None = None
         self._playback_start_frame = 0
         self._updating_form = False
+        self._updating_text_style_controls = False
+        self._text_editor_uses_rich_markup = False
         self._build_ui()
         self._connect_signals()
         self._apply_dark_palette()
@@ -1468,8 +1561,6 @@ class MainWindow(QMainWindow):
         route_form.addRow("Render Style", self.route_draw_mode_combo)
         route_form.addRow("Start Frame", self.route_start_spin)
         route_form.addRow("End Frame", self.route_end_spin)
-        route_form.addRow("Legend Label", self.route_label_edit)
-        route_form.addRow("Show Legend", self.route_legend_check)
         route_form.addRow("Timing", self.route_keyframe_status_label)
         route_form.addRow("Reveal Progress", self.route_progress_spin)
         route_form.addRow("Keyframe", route_keyframe_buttons)
@@ -1479,9 +1570,40 @@ class MainWindow(QMainWindow):
         text_form.setContentsMargins(10, 12, 10, 10)
         self.text_keyframe_status_label = QLabel("Default text used for this layer.")
         self.text_keyframe_status_label.setWordWrap(True)
-        self.text_template_edit = QPlainTextEdit()
+        self.text_template_edit = QTextEdit()
+        self.text_template_edit.setAcceptRichText(True)
         self.text_template_edit.setPlaceholderText("Text or template, e.g. Year: {time_label}")
-        self.text_template_edit.setFixedHeight(72)
+        self.text_template_edit.setFixedHeight(148)
+        self.text_style_toolbar = QWidget()
+        text_style_toolbar_layout = QHBoxLayout(self.text_style_toolbar)
+        text_style_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        text_style_toolbar_layout.setSpacing(6)
+        self.text_inline_font_combo = QFontComboBox()
+        self.text_inline_size_spin = QSpinBox()
+        self.text_inline_size_spin.setRange(6, 240)
+        self.text_inline_size_spin.setFixedWidth(72)
+        self.text_inline_color_button = QPushButton("Text Color")
+        self.text_bold_button = QToolButton()
+        self.text_bold_button.setText("B")
+        self.text_bold_button.setCheckable(True)
+        self.text_italic_button = QToolButton()
+        self.text_italic_button.setText("I")
+        self.text_italic_button.setCheckable(True)
+        self.text_underline_button = QToolButton()
+        self.text_underline_button.setText("U")
+        self.text_underline_button.setCheckable(True)
+        self.text_inline_font_combo.setToolTip("Apply a font family to the selected text or the current typing position.")
+        self.text_inline_size_spin.setToolTip("Apply a font size to the selected text or the current typing position.")
+        self.text_inline_color_button.setToolTip("Apply a text color to the selected text or the current typing position.")
+        self.text_bold_button.setToolTip("Toggle bold for the selected text or the current typing position.")
+        self.text_italic_button.setToolTip("Toggle italic for the selected text or the current typing position.")
+        self.text_underline_button.setToolTip("Toggle underline for the selected text or the current typing position.")
+        text_style_toolbar_layout.addWidget(self.text_inline_font_combo, 1)
+        text_style_toolbar_layout.addWidget(self.text_inline_size_spin)
+        text_style_toolbar_layout.addWidget(self.text_inline_color_button)
+        text_style_toolbar_layout.addWidget(self.text_bold_button)
+        text_style_toolbar_layout.addWidget(self.text_italic_button)
+        text_style_toolbar_layout.addWidget(self.text_underline_button)
         self.set_text_keyframe_button = QPushButton("Set Text Keyframe")
         self.set_text_keyframe_button.setToolTip("Create or update a frame-specific text override for the current timeline position.")
         self.delete_text_keyframe_button = QPushButton("Delete Text Keyframe")
@@ -1537,6 +1659,7 @@ class MainWindow(QMainWindow):
         self.text_frame_end_spin.setSpecialValueText("Project End")
         text_form.addRow("Opacity", self.text_opacity_spin)
         text_form.addRow("Text Scope", self.text_keyframe_status_label)
+        text_form.addRow("Text Style", self.text_style_toolbar)
         text_form.addRow("Text / Template", self.text_template_edit)
         text_form.addRow("Keyframe", text_keyframe_buttons)
         text_form.addRow("Text Anchor", self.text_anchor_combo)
@@ -1644,14 +1767,19 @@ class MainWindow(QMainWindow):
         self.route_draw_mode_combo.currentIndexChanged.connect(self._apply_layer_form)
         self.route_start_spin.valueChanged.connect(self._apply_layer_form)
         self.route_end_spin.valueChanged.connect(self._apply_layer_form)
-        self.route_label_edit.editingFinished.connect(self._apply_layer_form)
-        self.route_legend_check.stateChanged.connect(self._apply_layer_form)
         self.route_progress_spin.valueChanged.connect(self._apply_route_keyframe_form)
         self.set_route_keyframe_button.clicked.connect(self._set_route_keyframe)
         self.delete_route_keyframe_button.clicked.connect(self._delete_route_keyframe)
         self.text_template_edit.textChanged.connect(self._apply_layer_form)
+        self.text_template_edit.currentCharFormatChanged.connect(self._sync_text_style_controls)
         self.set_text_keyframe_button.clicked.connect(self._set_text_keyframe)
         self.delete_text_keyframe_button.clicked.connect(self._delete_text_keyframe)
+        self.text_inline_font_combo.currentFontChanged.connect(self._apply_text_selection_font_family)
+        self.text_inline_size_spin.valueChanged.connect(self._apply_text_selection_font_size)
+        self.text_inline_color_button.clicked.connect(self._pick_text_inline_color)
+        self.text_bold_button.toggled.connect(self._apply_text_selection_bold)
+        self.text_italic_button.toggled.connect(self._apply_text_selection_italic)
+        self.text_underline_button.toggled.connect(self._apply_text_selection_underline)
         self.text_opacity_spin.valueChanged.connect(self._apply_layer_form)
         self.text_anchor_combo.currentIndexChanged.connect(self._apply_layer_form)
         self.text_align_combo.currentIndexChanged.connect(self._apply_layer_form)
@@ -1678,6 +1806,7 @@ class MainWindow(QMainWindow):
         self.delete_time_keyframe_button.clicked.connect(self._delete_time_keyframe)
         self.canvas.drawingFinished.connect(self._handle_drawing_finished)
         self.canvas.polygonKeyframesChanged.connect(self._refresh_keyframe_track)
+        self.canvas.textLayerMoveFinished.connect(self._sync_selected_text_offset_controls)
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._advance_frame)
 
@@ -1954,12 +2083,45 @@ class MainWindow(QMainWindow):
                 return keyframe
         return None
 
+    def _set_text_style_controls_enabled(self, enabled: bool) -> None:
+        for widget in [
+            self.text_inline_font_combo,
+            self.text_inline_size_spin,
+            self.text_inline_color_button,
+            self.text_bold_button,
+            self.text_italic_button,
+            self.text_underline_button,
+        ]:
+            widget.setEnabled(enabled)
+
+    def _html_body_markup(self, markup: str) -> str:
+        match = _HTML_BODY_RE.search(str(markup or ""))
+        return match.group(1).strip() if match else str(markup or "").strip()
+
+    def _set_text_editor_content(self, template: str, layer: TextOverlayLayer) -> None:
+        content = str(template or "")
+        self._text_editor_uses_rich_markup = text_template_is_rich(content)
+        self.text_template_edit.blockSignals(True)
+        if self._text_editor_uses_rich_markup:
+            self.text_template_edit.setHtml(content)
+        else:
+            self.text_template_edit.setPlainText(content)
+        self.text_template_edit.blockSignals(False)
+        self._sync_text_style_controls(None, layer=layer)
+
+    def _serialize_text_editor_template(self) -> str:
+        if not self.text_template_edit.toPlainText().strip():
+            return ""
+        if self._text_editor_uses_rich_markup:
+            return self._html_body_markup(self.text_template_edit.toHtml())
+        return self.text_template_edit.toPlainText().strip()
+
     def _populate_text_form(self, layer: TextOverlayLayer) -> None:
         current_frame = int(self.timeline_slider.value())
         exact_keyframe = self._selected_text_keyframe_at_current_frame(layer)
         active_template = text_overlay_template_at_frame(layer, current_frame)
 
-        self.text_template_edit.setPlainText(exact_keyframe.template if exact_keyframe is not None else layer.template)
+        self._set_text_editor_content(exact_keyframe.template if exact_keyframe is not None else layer.template, layer)
         if exact_keyframe is not None:
             status = f"Editing text keyframe at frame {current_frame}."
         elif layer.text_keyframes and active_template != layer.template:
@@ -2070,6 +2232,7 @@ class MainWindow(QMainWindow):
         kind, layer = self._selected_layer()
         self.canvas.set_selected_polygon_layer(layer.id if kind == "polygon" and layer is not None else None)
         self.canvas.set_selected_route_layer(layer.id if kind == "route" and layer is not None else None)
+        self.canvas.set_selected_text_layer(layer.id if kind == "text" and layer is not None else None)
         self._refresh_keyframe_track()
         self._set_selected_panel_kind(kind if layer is not None else None)
         self._updating_form = True
@@ -2093,6 +2256,7 @@ class MainWindow(QMainWindow):
             self.set_text_keyframe_button.setText("Set Text Keyframe")
             self.set_text_keyframe_button.setEnabled(False)
             self.delete_text_keyframe_button.setEnabled(False)
+            self._set_text_style_controls_enabled(False)
             self.text_opacity_spin.setValue(1.0)
             self.text_anchor_combo.setCurrentIndex(max(0, self.text_anchor_combo.findData("top_right")))
             self.text_align_combo.setCurrentIndex(max(0, self.text_align_combo.findData("right")))
@@ -2103,12 +2267,14 @@ class MainWindow(QMainWindow):
             self.text_padding_y_spin.setValue(12)
             self._set_text_background_color_button([11, 15, 21])
             self.text_background_opacity_spin.setValue(0.72)
+            self._set_text_inline_color_button([247, 250, 252])
             self._set_text_border_color_button([225, 232, 242])
             self.text_border_opacity_spin.setValue(0.28)
             self.text_border_width_spin.setValue(1)
             self.text_corner_radius_spin.setValue(12)
             self.text_frame_start_spin.setValue(0)
             self.text_frame_end_spin.setValue(-1)
+            self._text_editor_uses_rich_markup = False
             self._populate_polygon_easing_form(None, None, False)
             self._updating_form = False
             return
@@ -2142,6 +2308,7 @@ class MainWindow(QMainWindow):
             self._populate_route_form(layer)
             self._populate_polygon_easing_form(None, None, False)
         else:
+            self._set_text_style_controls_enabled(True)
             self.text_opacity_spin.setValue(layer.opacity)
             self.set_text_keyframe_button.setEnabled(True)
             self._populate_text_form(layer)
@@ -2305,7 +2472,7 @@ class MainWindow(QMainWindow):
         else:
             layer.opacity = float(self.text_opacity_spin.value())
             exact_keyframe = self._selected_text_keyframe_at_current_frame(layer)
-            target_template = self.text_template_edit.toPlainText().strip()
+            target_template = self._serialize_text_editor_template()
             if exact_keyframe is None:
                 layer.template = target_template
             else:
@@ -2345,8 +2512,96 @@ class MainWindow(QMainWindow):
     def _set_text_background_color_button(self, rgb: list[int]) -> None:
         self._set_swatch_button(self.text_background_color_button, rgb, "Pick Background")
 
+    def _set_text_inline_color_button(self, rgb: list[int]) -> None:
+        self._set_swatch_button(self.text_inline_color_button, rgb, "Text Color")
+
     def _set_text_border_color_button(self, rgb: list[int]) -> None:
         self._set_swatch_button(self.text_border_color_button, rgb, "Pick Border")
+
+    def _sync_text_style_controls(
+        self,
+        current_format: QTextCharFormat | None = None,
+        layer: TextOverlayLayer | None = None,
+    ) -> None:
+        if self._updating_text_style_controls:
+            return
+        if layer is None:
+            kind, selected_layer = self._selected_layer()
+            if kind != "text" or selected_layer is None:
+                return
+            layer = selected_layer
+        if current_format is None:
+            current_format = self.text_template_edit.currentCharFormat()
+
+        font = current_format.font() if current_format is not None else QFont()
+        family = font.family() or self.text_inline_font_combo.currentFont().family()
+        size = float(current_format.fontPointSize()) if current_format is not None else 0.0
+        if size <= 0.0:
+            size = float(font.pointSizeF())
+        if size <= 0.0:
+            size = float(layer.font_size)
+        color = current_format.foreground().color() if current_format is not None else QColor()
+        if not color.isValid():
+            color = QColor(*layer.color)
+
+        self._updating_text_style_controls = True
+        self.text_inline_font_combo.blockSignals(True)
+        self.text_inline_font_combo.setCurrentFont(QFont(family))
+        self.text_inline_font_combo.blockSignals(False)
+        self.text_inline_size_spin.blockSignals(True)
+        self.text_inline_size_spin.setValue(max(1, int(round(size))))
+        self.text_inline_size_spin.blockSignals(False)
+        self.text_bold_button.blockSignals(True)
+        self.text_bold_button.setChecked(font.bold())
+        self.text_bold_button.blockSignals(False)
+        self.text_italic_button.blockSignals(True)
+        self.text_italic_button.setChecked(font.italic())
+        self.text_italic_button.blockSignals(False)
+        self.text_underline_button.blockSignals(True)
+        self.text_underline_button.setChecked(font.underline())
+        self.text_underline_button.blockSignals(False)
+        self._set_text_inline_color_button([color.red(), color.green(), color.blue()])
+        self._updating_text_style_controls = False
+
+    def _apply_text_char_format(self, formatter) -> None:
+        if self._updating_form or self._updating_text_style_controls:
+            return
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            return
+        char_format = QTextCharFormat()
+        formatter(char_format)
+        self._text_editor_uses_rich_markup = True
+        self.text_template_edit.mergeCurrentCharFormat(char_format)
+        self._apply_layer_form()
+
+    def _apply_text_selection_font_family(self, font: QFont) -> None:
+        self._apply_text_char_format(lambda fmt: fmt.setFontFamily(font.family()))
+
+    def _apply_text_selection_font_size(self, value: int) -> None:
+        self._apply_text_char_format(lambda fmt: fmt.setFontPointSize(float(value)))
+
+    def _apply_text_selection_bold(self, checked: bool) -> None:
+        self._apply_text_char_format(
+            lambda fmt: fmt.setFontWeight(QFont.Weight.Bold if checked else QFont.Weight.Normal)
+        )
+
+    def _apply_text_selection_italic(self, checked: bool) -> None:
+        self._apply_text_char_format(lambda fmt: fmt.setFontItalic(bool(checked)))
+
+    def _apply_text_selection_underline(self, checked: bool) -> None:
+        self._apply_text_char_format(lambda fmt: fmt.setFontUnderline(bool(checked)))
+
+    def _pick_text_inline_color(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            return
+        current_rgb = self.text_inline_color_button.property("rgb") or layer.color
+        color = QColorDialog.getColor(QColor(*current_rgb), self, "Pick Inline Text Color")
+        if not color.isValid():
+            return
+        self._apply_text_char_format(lambda fmt: fmt.setForeground(color))
+        self._set_text_inline_color_button([color.red(), color.green(), color.blue()])
 
     def _pick_color(self) -> None:
         kind, layer = self._selected_layer()
@@ -2380,6 +2635,16 @@ class MainWindow(QMainWindow):
             return
         self._set_text_border_color_button([color.red(), color.green(), color.blue()])
         self._apply_layer_form()
+
+    def _sync_selected_text_offset_controls(self) -> None:
+        kind, layer = self._selected_layer()
+        if kind != "text" or layer is None:
+            return
+        self._updating_form = True
+        self.text_offset_x_spin.setValue(float(layer.offset_x) * 100.0)
+        self.text_offset_y_spin.setValue(float(layer.offset_y) * 100.0)
+        self._updating_form = False
+        self.statusBar().showMessage(f"Text box moved: {layer.name}", 2000)
 
     def _begin_polygon_keyframe(self) -> None:
         kind, layer = self._selected_layer()
@@ -2586,6 +2851,7 @@ class MainWindow(QMainWindow):
                 name=f"Route {len(self.project.route_layers) + 1}",
                 color=color,
                 label=f"Route {len(self.project.route_layers) + 1}",
+                show_in_legend=False,
                 start_frame=frame_index,
                 end_frame=end_frame,
                 keyframes=[

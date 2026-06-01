@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import html
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,7 @@ DEFAULT_ROUTE_DRAW_MODE = "reveal_only"
 
 
 _TEMPLATE_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+_RICH_TEXT_TAG_RE = re.compile(r"<\s*(?:!DOCTYPE|/?[a-zA-Z][^>]*)>", re.IGNORECASE)
 
 
 def _uid(prefix: str) -> str:
@@ -419,6 +421,22 @@ def render_text_template(template: str, project: Project, frame_index: int) -> s
         return context.get(token, match.group(0))
 
     return _TEMPLATE_TOKEN_RE.sub(_replace, str(template or ""))
+
+
+def render_text_template_html(template: str, project: Project, frame_index: int) -> str:
+    context = build_text_template_context(project, frame_index)
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token not in context:
+            return match.group(0)
+        return html.escape(context[token])
+
+    return _TEMPLATE_TOKEN_RE.sub(_replace, str(template or ""))
+
+
+def text_template_is_rich(template: str) -> bool:
+    return bool(_RICH_TEXT_TAG_RE.search(str(template or "")))
 
 
 def project_to_dict(project: Project, project_file: str | Path | None = None) -> dict[str, Any]:

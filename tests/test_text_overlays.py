@@ -1,6 +1,6 @@
 import unittest
 
-from exploration_editor.model import Project, TextOverlayKeyframe, TextOverlayLayer, TimeKeyframe, build_text_template_context, interpolate_project_year, project_time_label, project_to_dict, render_text_template, text_overlay_template_at_frame
+from exploration_editor.model import Project, TextOverlayKeyframe, TextOverlayLayer, TimeKeyframe, build_text_template_context, interpolate_project_year, project_time_label, project_to_dict, render_text_template, render_text_template_html, text_overlay_template_at_frame, text_template_is_rich
 
 
 class TextOverlayTemplateTests(unittest.TestCase):
@@ -56,6 +56,21 @@ class TextOverlayTemplateTests(unittest.TestCase):
         self.assertIn("-98564", rendered)
         self.assertIn("98,564 BC", rendered)
         self.assertIn("{unknown}", rendered)
+
+    def test_render_text_template_html_escapes_placeholder_values(self) -> None:
+        project = Project(
+            title="A&B",
+            time_keyframes=[TimeKeyframe(frame=0, year=2026, label="Now & <Soon>")],
+        )
+
+        rendered = render_text_template_html("<p>{project_title} | {time_label}</p>", project, 0)
+
+        self.assertIn("A&amp;B", rendered)
+        self.assertIn("Now &amp; &lt;Soon&gt;", rendered)
+
+    def test_text_template_is_rich_detects_html_markup(self) -> None:
+        self.assertTrue(text_template_is_rich("<p><span style='color: red;'>Styled</span></p>"))
+        self.assertFalse(text_template_is_rich("Plain text only"))
 
     def test_template_context_exposes_blank_time_fields_without_time_track(self) -> None:
         project = Project(title="Untitled", fps=30, duration_sec=5.0)

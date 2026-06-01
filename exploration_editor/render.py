@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import html
+import os
 from pathlib import Path
+import re
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QTextDocument, QTextOption
+from PyQt6.QtWidgets import QApplication
 
 from exploration_editor.basemap import load_basemap_image
 from exploration_editor.geometry import expand_closed_path_structure, lonlat_to_world, polygon_points_at_frame, polygon_segment_progress, rounded_closed_path, rounded_open_path, unwrap_longitudes
-from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template, route_layer_progress_at_frame, text_overlay_template_at_frame
+from exploration_editor.model import PolygonLayer, Project, RouteLayer, TextOverlayLayer, ViewState, render_text_template, render_text_template_html, route_layer_progress_at_frame, text_overlay_template_at_frame
 
 
 @dataclass(frozen=True)
@@ -18,6 +24,20 @@ class PreparedFrameRender:
     layout: dict[str, float]
     background_array: np.ndarray
     map_alpha: np.ndarray
+
+
+@dataclass(frozen=True)
+class TextOverlayPanelLayout:
+    layer_id: str
+    panel_rect: tuple[float, float, float, float]
+
+
+@dataclass
+class _TextOverlayRenderData:
+    layer: TextOverlayLayer
+    document: QTextDocument
+    panel_rect: tuple[float, float, float, float]
+    text_origin: tuple[float, float]
 
 
 _TEXT_ANCHOR_RATIOS = {
@@ -31,6 +51,10 @@ _TEXT_ANCHOR_RATIOS = {
     "bottom_center": (0.5, 1.0),
     "bottom_right": (1.0, 1.0),
 }
+
+_RICH_TEXT_TAG_RE = re.compile(r"<\s*(?:!DOCTYPE|/?(?:html|body|div|span|p|br|strong|em|u|b|i|font|h[1-6]|ul|ol|li)\b)", re.IGNORECASE)
+_RICH_TEXT_FONT_SIZE_RE = re.compile(r"(font-size\s*:\s*)([0-9]*\.?[0-9]+)(px|pt)", re.IGNORECASE)
+_QT_FALLBACK_APP: QApplication | None = None
 
 
 def clamp_view_state(
@@ -512,6 +536,199 @@ def _text_panel_origin(
     return anchor_x - panel_w * ratio_x, anchor_y - panel_h * ratio_y
 
 
+def _ensure_qt_application() -> QApplication:
+    app = QApplication.instance()
+    if app is not None:
+        return app
+
+    global _QT_FALLBACK_APP
+    if _QT_FALLBACK_APP is None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        _QT_FALLBACK_APP = QApplication([])
+    return _QT_FALLBACK_APP
+
+
+@lru_cache(maxsize=16)
+def _qt_font_family(font_key: str) -> str:
+    if not font_key:
+        return ""
+    font_id = QFontDatabase.addApplicationFont(font_key)
+    if font_id < 0:
+        return ""
+    families = QFontDatabase.applicationFontFamilies(font_id)
+    return families[0] if families else ""
+
+
+def _looks_like_rich_text(value: str) -> bool:
+    return bool(_RICH_TEXT_TAG_RE.search(str(value or "")))
+
+
+def _plain_text_markup(value: str) -> str:
+    lines = str(value or "").splitlines()
+    if not lines:
+        return ""
+    return "<br/>".join(html.escape(line) for line in lines)
+
+
+def _qt_alignment(alignment: str) -> Qt.AlignmentFlag:
+    alignment_value = str(alignment or "right").strip().lower()
+    if alignment_value == "left":
+        return Qt.AlignmentFlag.AlignLeft
+    if alignment_value == "center":
+        return Qt.AlignmentFlag.AlignHCenter
+    return Qt.AlignmentFlag.AlignRight
+
+
+def _text_document_html(
+    layer: TextOverlayLayer,
+    content_markup: str,
+    font_size_px: int,
+    font_family: str,
+) -> str:
+    css_parts = [
+        f"color: rgb({int(layer.color[0])}, {int(layer.color[1])}, {int(layer.color[2])});",
+        f"font-size: {int(font_size_px)}px;",
+    ]
+    if font_family:
+        escaped_family = font_family.replace("'", "\\'")
+        css_parts.append(f"font-family: '{escaped_family}';")
+    default_css = " ".join(css_parts)
+    text_align = str(layer.alignment or "right").strip().lower()
+    return (
+        "<html><head><style>"
+        "html, body { margin: 0; padding: 0; background: transparent; }"
+        f"body {{ {default_css} }}"
+        "p { margin: 0; }"
+        "</style></head>"
+        f"<body><div style=\"text-align: {text_align};\">{content_markup}</div></body></html>"
+    )
+
+
+def _text_document_stylesheet(layer: TextOverlayLayer, font_size_px: int, font_family: str) -> str:
+    css_parts = [
+        f"color: rgb({int(layer.color[0])}, {int(layer.color[1])}, {int(layer.color[2])});",
+        f"font-size: {int(font_size_px)}px;",
+        f"text-align: {str(layer.alignment or 'right').strip().lower()};",
+    ]
+    if font_family:
+        escaped_family = font_family.replace("'", "\\'")
+        css_parts.append(f"font-family: '{escaped_family}';")
+    default_css = " ".join(css_parts)
+    return (
+        "html, body { margin: 0; padding: 0; background: transparent; }"
+        f"body, div, p, span, li {{ {default_css} }}"
+        "p { margin: 0; }"
+    )
+
+
+def _scale_rich_text_font_sizes(markup: str, scale: float) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        prefix, raw_value, unit = match.groups()
+        scaled = max(1.0, float(raw_value) * max(0.01, float(scale)))
+        formatted = f"{scaled:.2f}".rstrip("0").rstrip(".")
+        return f"{prefix}{formatted}{unit}"
+
+    return _RICH_TEXT_FONT_SIZE_RE.sub(_replace, str(markup or ""))
+
+
+def _build_text_document(
+    layer: TextOverlayLayer,
+    project: Project,
+    frame_index: int,
+    frame_size: tuple[int, int],
+    font_path: str | Path | None,
+) -> QTextDocument | None:
+    _ensure_qt_application()
+    frame_h = frame_size[1]
+    scale = frame_h / 1080.0
+    font_size_px = max(1, _scale_frame_value(layer.font_size, scale, minimum=1))
+    font_key = str(Path(font_path).resolve()) if font_path else ""
+    font_family = _qt_font_family(font_key)
+
+    template = text_overlay_template_at_frame(layer, frame_index)
+    if _looks_like_rich_text(template):
+        content_markup = render_text_template_html(template, project, frame_index).strip()
+    else:
+        rendered_text = render_text_template(template, project, frame_index).strip()
+        content_markup = _plain_text_markup(rendered_text)
+    if not content_markup:
+        return None
+
+    document = QTextDocument()
+    document.setDocumentMargin(0.0)
+    option = document.defaultTextOption()
+    option.setWrapMode(QTextOption.WrapMode.NoWrap)
+    option.setAlignment(_qt_alignment(layer.alignment))
+    document.setDefaultTextOption(option)
+
+    default_font = QFont()
+    if font_family:
+        default_font.setFamily(font_family)
+    default_font.setPixelSize(font_size_px)
+    document.setDefaultFont(default_font)
+    document.setDefaultStyleSheet(_text_document_stylesheet(layer, font_size_px, font_family))
+    if _looks_like_rich_text(template):
+        document.setHtml(_scale_rich_text_font_sizes(content_markup, scale))
+    else:
+        document.setHtml(_text_document_html(layer, content_markup, font_size_px, font_family))
+    document.adjustSize()
+    return document
+
+
+def _build_text_overlay_render_data(
+    project: Project,
+    frame_index: int,
+    frame_size: tuple[int, int],
+    font_path: str | Path | None,
+) -> list[_TextOverlayRenderData]:
+    render_data: list[_TextOverlayRenderData] = []
+    frame_w, frame_h = frame_size
+    scale = frame_h / 1080.0
+    for layer in project.text_layers:
+        if not _text_layer_visible(layer, frame_index):
+            continue
+
+        document = _build_text_document(layer, project, frame_index, frame_size, font_path)
+        if document is None:
+            continue
+
+        document_size = document.size()
+        text_w = max(0.0, float(document_size.width()))
+        text_h = max(0.0, float(document_size.height()))
+        pad_x = _scale_frame_value(layer.padding_x, scale)
+        pad_y = _scale_frame_value(layer.padding_y, scale)
+        panel_w = text_w + pad_x * 2
+        panel_h = text_h + pad_y * 2
+        panel_x, panel_y = _text_panel_origin(layer, (frame_w, frame_h), (panel_w, panel_h))
+        render_data.append(
+            _TextOverlayRenderData(
+                layer=layer,
+                document=document,
+                panel_rect=(panel_x, panel_y, panel_w, panel_h),
+                text_origin=(panel_x + pad_x, panel_y + pad_y),
+            )
+        )
+    return render_data
+
+
+def text_overlay_panel_layouts(
+    project: Project,
+    frame_index: int,
+    frame_size: tuple[int, int],
+    font_path: str | Path | None,
+) -> list[TextOverlayPanelLayout]:
+    return [
+        TextOverlayPanelLayout(layer_id=item.layer.id, panel_rect=item.panel_rect)
+        for item in _build_text_overlay_render_data(project, frame_index, frame_size, font_path)
+    ]
+
+
+def _qimage_to_pil(image: QImage) -> Image.Image:
+    converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    raw = converted.bits().asstring(converted.sizeInBytes())
+    return Image.frombuffer("RGBA", (converted.width(), converted.height()), raw, "raw", "RGBA", 0, 1).copy()
+
+
 def _draw_text_overlays(
     frame_img: Image.Image,
     project: Project,
@@ -523,59 +740,42 @@ def _draw_text_overlays(
 
     frame_w, frame_h = frame_img.size
     scale = frame_h / 1080.0
-    overlay = Image.new("RGBA", frame_img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    overlay = QImage(frame_w, frame_h, QImage.Format.Format_RGBA8888)
+    overlay.fill(0)
+    painter = QPainter(overlay)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-    for layer in project.text_layers:
-        if not _text_layer_visible(layer, frame_index):
-            continue
-
-        text = render_text_template(text_overlay_template_at_frame(layer, frame_index), project, frame_index).strip()
-        if not text:
-            continue
-
-        font = _load_font(font_path, max(1, _scale_frame_value(layer.font_size, scale, minimum=1)))
-        spacing = max(0, _scale_frame_value(6, scale))
-        text_box = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=layer.alignment)
-        text_w = max(0, int(round(text_box[2] - text_box[0])))
-        text_h = max(0, int(round(text_box[3] - text_box[1])))
-        pad_x = _scale_frame_value(layer.padding_x, scale)
-        pad_y = _scale_frame_value(layer.padding_y, scale)
-        panel_w = text_w + pad_x * 2
-        panel_h = text_h + pad_y * 2
-        panel_x, panel_y = _text_panel_origin(layer, (frame_w, frame_h), (panel_w, panel_h))
-        panel_rect = [panel_x, panel_y, panel_x + panel_w, panel_y + panel_h]
+    for item in _build_text_overlay_render_data(project, frame_index, frame_img.size, font_path):
+        layer = item.layer
+        panel_x, panel_y, panel_w, panel_h = item.panel_rect
+        panel_rect = QRectF(panel_x, panel_y, panel_w, panel_h)
+        radius = max(0, _scale_frame_value(layer.corner_radius, scale))
 
         background_alpha = float(layer.opacity) * float(layer.background_opacity)
         if background_alpha > 0.0:
-            draw.rounded_rectangle(
-                panel_rect,
-                radius=max(0, _scale_frame_value(layer.corner_radius, scale)),
-                fill=_layer_rgba(layer.background_color, background_alpha),
-            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(*layer.background_color[:3], max(0, min(255, int(round(background_alpha * 255.0))))))
+            painter.drawRoundedRect(panel_rect, radius, radius)
 
         border_width = _scale_frame_value(layer.border_width, scale)
         border_alpha = float(layer.opacity) * float(layer.border_opacity)
         if border_width > 0 and border_alpha > 0.0:
-            draw.rounded_rectangle(
-                panel_rect,
-                radius=max(0, _scale_frame_value(layer.corner_radius, scale)),
-                outline=_layer_rgba(layer.border_color, border_alpha),
-                width=border_width,
-            )
+            border_pen = QPen(QColor(*layer.border_color[:3], max(0, min(255, int(round(border_alpha * 255.0))))))
+            border_pen.setWidth(border_width)
+            painter.setPen(border_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            inset = border_width * 0.5
+            painter.drawRoundedRect(panel_rect.adjusted(inset, inset, -inset, -inset), radius, radius)
 
-        text_x = panel_x + pad_x - float(text_box[0])
-        text_y = panel_y + pad_y - float(text_box[1])
-        draw.multiline_text(
-            (text_x, text_y),
-            text,
-            font=font,
-            fill=_layer_rgba(layer.color, float(layer.opacity)),
-            spacing=spacing,
-            align=layer.alignment,
-        )
+        painter.save()
+        painter.translate(*item.text_origin)
+        painter.setOpacity(max(0.0, min(1.0, float(layer.opacity))))
+        item.document.drawContents(painter)
+        painter.restore()
 
-    composed = Image.alpha_composite(frame_img.convert("RGBA"), overlay)
+    painter.end()
+    composed = Image.alpha_composite(frame_img.convert("RGBA"), _qimage_to_pil(overlay))
     frame_img.paste(composed.convert("RGB"), (0, 0))
 
 
@@ -742,6 +942,5 @@ def render_frame(
     frame_img = Image.fromarray(np.clip(frame_arr, 0, 255).astype(np.uint8), mode="RGB")
 
     _draw_routes(frame_img, project, frame_index, layout)
-    _draw_legend(frame_img, project, frame_index, font_path)
     _draw_text_overlays(frame_img, project, frame_index, font_path)
     return frame_img
